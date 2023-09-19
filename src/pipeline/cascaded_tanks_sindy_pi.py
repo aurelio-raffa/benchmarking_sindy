@@ -1,106 +1,96 @@
 """Code based on https://pysindy.readthedocs.io/en/latest/examples/9_sindypi_with_sympy/example.html#Find-complex-PDE-with-SINDy-PI-with-PDE-functionality
 """
 import warnings
-import re
 import signal
 
-import pandas as pd
 import numpy as np
 import pysindy as ps
 import matplotlib.pyplot as plt
 import sympy as sp
 
+from typing import Tuple
+from fire import Fire
 from scipy.integrate import solve_ivp
 from pynumdiff.total_variation_regularization import jerk
 
+from src.utils.import_cascaded_tanks_data import import_cascaded_tanks_data
+from src.utils.symbolic_conversion import prepare_for_sympy
 
-from __init__ import *
+
+def compute_derivatives(
+        x: np.ndarray,
+        dt: float,
+        tvr_gamma: float = 10.0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Computes the second derivative of the data x using TV regularization.
+    """
+    _, x_dot = jerk(x, dt, params=[tvr_gamma])
+    _, x_ddot = jerk(x_dot, dt, params=[tvr_gamma])
+    return x_dot, x_ddot
 
 
-if __name__ == '__main__':
-    # Load the data
-    data = pd.read_csv(os.path.join(root_path, 'data/CascadedTanksFiles/dataBenchmark.csv'))
-    train_data = data.loc[:, ['uEst', 'yEst']].copy().rename(columns={'uEst': 'u', 'yEst': 'y'})
-    test_data = data.loc[:, ['uVal', 'yVal']].copy().rename(columns={'uVal': 'u', 'yVal': 'y'})
-    t = np.linspace(0.0, 4.0, num=len(train_data))
-    dt = 4.0 / len(train_data)
-    print(data.describe())
+def main(
+        rescale_factor: float = 10.0,
+        tvr_gamma: float = 10.0,
+        threshold: float = 1e-1,
+        thresholder: str = "l1",
+        tol: float = 1e-6,
+        max_iter: int = 20000,
+):
+    """Computes a second-order model with SINDy-PI for the cascaded tanks data.
+    """
+    # 01 - Loading the data
+    train_data, test_data, t, dt = import_cascaded_tanks_data()
 
-    x = train_data['y'].values / 10
-    x_hat, x_dot = jerk(x, dt, params=[10.0])
-    x_dot_hat, x_dot_dot = jerk(x_dot, dt, params=[10.0])
-    u_train = train_data['u'].values.reshape(-1, 1) / 10
-    #
-    # df_new = pd.DataFrame(
-    #     {'x': x, 'x_dot': x_dot, 'x_dot_dot': x_dot_dot, 'u': u_train.ravel(), 't': t, 'x_hat': x_hat, 'x_dot_hat': x_dot_hat}
-    # )
-    # print(df_new)
-    # df_new = df_new.loc[np.logical_and(df_new['x'] > 0.0, df_new['x'] < 1.0)]
-    # [x, x_dot, x_dot_dot, u_train, t, x_hat, x_dot_hat] = [
-    #     df_new['x'].values, df_new['x_dot'].values, df_new['x_dot_dot'].values, df_new['u'].values, df_new['t'].values,
-    #     df_new['x_hat'].values, df_new['x_dot_hat'].values
-    # ]
+    # TODO: rescale back when saving the results
+    # 01b - Rescaling the data (for numerical stability)
+    train_data /= rescale_factor
+    test_data /= rescale_factor
 
-    _, (ax1, ax2, ax3, ax4) = plt.subplots(4, 1, figsize=(10, 10), sharex=True)
-    ax1.plot(t, x_dot_dot, label='x_dot_dot')
-    ax2.plot(t, x_dot_hat, label='x_dot_hat')
-    ax2.plot(t, x_dot, label='x_dot')
-    ax3.plot(t, x_hat, label='x_hat')
-    ax3.plot(t, x, label='x')
-    ax4.plot(t, u_train, label='u')
-    ax1.legend()
-    ax2.legend()
-    ax3.legend()
-    ax4.legend()
-    plt.show()
+    # 02 - Computing the derivatives (using TV regularization) and preparing the dataset
+    u_train = train_data['u'].values.reshape(-1, 1)
+    x = train_data['y'].values
+    x_dot, x_ddot = compute_derivatives(x, dt=dt, tvr_gamma=tvr_gamma)
+    x_train = np.concatenate(
+        [
+            x_ddot.reshape(-1, 1),
+            x_dot.reshape(-1, 1),
+            x.reshape(-1, 1)
+        ],
+        axis=1
+    )
 
-    # Functions to be applied to the data x_dot
-    x_dot_functions = [lambda x: x]
-
-    # Functions to be applied to the data x
+    # 03 - Definition of the library of functions to be applied to the data
+    #   The library is created so as to contain only the candidate terms that we know must enter in the 2nd order model.
+    #   In particular, the square root is only applied to the state, x, but not to its derivatives.
+    #   Also, we do not include the square of x_ddot as we want to solve symbolically for x_ddot without ambiguity.
+    #   For numerical reasons, we ensure the root can be computed by thresholding to zero.
     functions = [
-        lambda x: x,
-        lambda x, y: x * y,
-        lambda _, x, __, ___: x ** 2,
-        lambda _, __, x, ___: x ** 2,
-        lambda _, __, ___, x: x ** 2,
-        # lambda x: np.sqrt(np.abs(x)),
-        # lambda x: x * np.sqrt(np.abs(x)),
-        lambda _, x, y, __: x * np.sqrt(np.where(y >= 0, y, 0)),
-        lambda _, __, x, y: np.sqrt(np.where(x >= 0, x, 0)) * y,
-        # lambda x, y, z: np.sqrt(np.abs(x)) * y * z,
-        lambda x, y, z, _: x * y * np.sqrt(np.where(z >= 0, z, 0)),
-        # lambda x, y, z: x * y * np.sqrt(z)
+        lambda x_: x_,                                                      # identity for all terms
+        lambda x_, y: x_ * y,                                               # pairwise product of all terms
+        lambda _, x_, __, ___: x_ ** 2,                                     # squares for all terms except x_ddot
+        lambda _, __, x_, ___: x_ ** 2,
+        lambda _, __, ___, x_: x_ ** 2,
+        lambda _, x_, y, __: x_ * np.sqrt(np.where(y >= 0, y, 0)),          # sqrt(x) * x_dot
+        lambda _, __, x_, y: np.sqrt(np.where(x_ >= 0, x_, 0)) * y,         # sqrt(x) * u
+        lambda x_, y, z, _: x_ * y * np.sqrt(np.where(z >= 0, z, 0)),       # sqrt(x) * x_dot * x_ddot
     ]
+    # The features and function names are very important as they allow to translate the obtained models into sympy
+    # objects, which allow to solve the equations symbolically for x_ddot and obtain the models.
+    feature_names = ['xdd', 'xd', 'x', 'u']
     function_names = [
-        lambda x: x,
-        lambda x, y: x + ' * ' + y,
-        lambda _, x, __, ___: x + "**2",
-        lambda _, __, x, ___: x + "**2",
-        lambda _, __, ___, x: x + "**2",
-        # lambda x: "sqrt(" + x + ")",
-        # lambda x: x + "sqrt(" + x + ")",
-        lambda _, x, y, __: x + ' * ' + "sqrt(max(" + y + ", 0))",
-        lambda _, __, x, y: "sqrt(max(" + x + ", 0))" + ' * ' + y,
-        # lambda x, y, z: "sqrt(" + x + ")" + y + z,
-        lambda x, y, z, _: x + ' * ' + y + ' * ' + "sqrt(max(" + z + ", 0))",
-        # lambda x, y, z: x + y + "sqrt(" + z + ")",
+        lambda x_: x_,
+        lambda x_, y: x_ + ' * ' + y,
+        lambda _, x_, __, ___: x_ + "**2",
+        lambda _, __, x_, ___: x_ + "**2",
+        lambda _, __, ___, x_: x_ + "**2",
+        lambda _, x_, y, __: x_ + ' * ' + "sqrt(max(" + y + ", 0))",
+        lambda _, __, x_, y: "sqrt(max(" + x_ + ", 0))" + ' * ' + y,
+        lambda x_, y, z, _: x_ + ' * ' + y + ' * ' + "sqrt(max(" + z + ", 0))",
     ]
-    # function_names = [
-    #     lambda x: x,
-    #     lambda x, y: x + y,
-    #     lambda _, x, __, ___: x + "**2",
-    #     lambda _, __, x, ___: x + "**2",
-    #     lambda _, __, ___, x: x + "**2",
-    #     # lambda x: "sqrt(" + x + ")",
-    #     # lambda x: x + "sqrt(" + x + ")",
-    #     lambda _, x, y, __: x + "sqrt(" + y + ")",
-    #     lambda _, __, x, y: "sqrt(" + x + ")" + y,
-    #     # lambda x, y, z: "sqrt(" + x + ")" + y + z,
-    #     lambda x, y, z, _: x + y + "sqrt(" + z + ")",
-    #     # lambda x, y, z: x + y + "sqrt(" + z + ")",
-    # ]
-
+    # In the pysindy package, implicit libraries can be defined via the PDELibrary.
+    # Notice that the derivative order is set to 0 since we have manually computed the derivatives.
+    # Also, we do not want to allow for a bias term as we have derived the model through differentiation.
     lib = ps.PDELibrary(
         library_functions=functions,
         derivative_order=0,
@@ -110,69 +100,30 @@ if __name__ == '__main__':
         temporal_grid=t
     )
 
-    # lib = sindy_library = ps.SINDyPILibrary(
-    #     library_functions=functions,
-    #     x_dot_library_functions=[lambda x: x],
-    #     t=t,
-    #     function_names=[lambda x: x] + function_names,
-    #     include_bias=True,
-    # )
-
+    # 04 - Fitting the model on the estimation data
+    #   The SINDyPI solver will attempt to fit one implicit model for each candidate term.
+    #   Beware that this could quickly get out of hand for large candidate libraries.
     sindy_opt = ps.SINDyPI(
-        threshold=1e-1,
-        tol=1e-6,
-        thresholder="l1",
-        max_iter=20000,
+        threshold=threshold,
+        tol=tol,
+        thresholder=thresholder,
+        max_iter=max_iter,
     )
-
-    features = ['xdd', 'xd', 'x', 'u']
     model = ps.SINDy(
         optimizer=sindy_opt,
         feature_library=lib,
-        feature_names=features,
+        feature_names=feature_names,
         differentiation_method=ps.FiniteDifference(drop_endpoints=True),
     )
-
-    x_train = np.concatenate(
-        [
-            x_dot_dot.reshape(-1, 1),
-            x_dot.reshape(-1, 1),
-            x.reshape(-1, 1)
-        ],
-        axis=1
-    )
-    # print(lib.fit(np.concatenate([x_train, u_train], axis=1)).get_feature_names())
-    # exit( 1)
-
     model.fit(x_train, t=t, u=u_train)
-    # model.print()
 
-
-    # # Need to put multiplication between terms for sympy
-    # print(features)
-    # model_features = list(np.copy(model.get_feature_names()))
-    # print(model_features)
-    # nfeatures = len(features)
-    # coefs = model.coefficients()
-    # sym_features = np.array([sp.symbols(feature) for feature in features])
-    # sym_theta = np.array([sp.symbols(feature) for feature in model_features])
-    #
-    # print(sym_theta[0])
-    # print(sym_theta)
-    # print(np.around(coefs[0], 10))
-    # print(sym_theta @ np.around(coefs[0], 10))
-
-    def make_sympifiable(equation: str):
-        equation = equation.replace('+ -', '- ')
-        return re.sub(r'(\d+\.\d+)\s([a-zA-Z]+)', r'\1 * \2', equation)
-
-
+    # 05 - Converting the implicit models to 2nd order explicit models via symbolic computation
     model_equations = model.equations(precision=5)
     model_features = list(np.copy(model.get_feature_names()))
     odes = []
     simulations = []
     for lhs, rhs in zip(model_features, model_equations):
-        fixed_rhs = make_sympifiable(rhs)
+        fixed_rhs = prepare_for_sympy(rhs)
         print(f'original equation:\n\t{lhs} = {fixed_rhs}')
         [symbolic_expression] = sp.solve(sp.Eq(sp.sympify(lhs), sp.sympify(fixed_rhs)), sp.symbols('xdd'))
         print(f'solved as:\n\t{symbolic_expression}')
@@ -202,7 +153,8 @@ if __name__ == '__main__':
                         x_dd = 0.0
             return np.array([x_dd, x_d])
 
-        class TimeoutException(Exception): pass
+        class TimeoutException(Exception):
+            pass
 
         def handler(signum, frame):
             warnings.warn("Timeout reached")
@@ -247,3 +199,7 @@ if __name__ == '__main__':
     #         )
     #     )
     #     print(sym_theta[i], " = ", sym_equations_rounded[i][0])
+
+
+if __name__ == '__main__':
+    Fire(main)
