@@ -23,4 +23,4 @@ def import_cascaded_tanks_data(
     train_data = data.loc[:, ['uEst', 'yEst']].copy().rename(columns={'uEst': 'u', 'yEst': 'y'})
     test_data = data.loc[:, ['uVal', 'yVal']].copy().rename(columns={'uVal': 'u', 'yVal': 'y'})
 
-    return train_data, test_data, t, dt
+    return train_data, test_data, t, dt, tf
