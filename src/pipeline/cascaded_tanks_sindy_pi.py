@@ -1,7 +1,7 @@
 """Code based on https://pysindy.readthedocs.io/en/latest/examples/9_sindypi_with_sympy/example.html#Find-complex-PDE-with-SINDy-PI-with-PDE-functionality
 """
 import warnings
-import signal
+import os
 
 import numpy as np
 import pandas as pd
@@ -16,6 +16,7 @@ from pynumdiff.total_variation_regularization import jerk
 from sklearn.metrics import r2_score
 from tqdm import tqdm
 
+from __init__ import root_path
 from src.utils.import_cascaded_tanks_data import import_cascaded_tanks_data
 from src.utils.symbolic_conversion import prepare_for_sympy
 from src.utils.timeout import TimeoutException, timeout_handler, TimeoutManager
@@ -77,14 +78,15 @@ def prepare_for_simulation(
     return ode_wrapper
 
 
+# TODO: hpo
 def main(
         rescale_factor: float = 10.0,
-        tvr_gamma: float = 10.0,
-        threshold: float = 1e-2,
+        tvr_gamma: float = 8.0,
+        threshold: float = 0.1,
         thresholder: str = "l1",
         tol: float = 1e-6,
-        max_iter: int = 20000,
-        precision: int = 5,
+        max_iter: int = 50000,
+        precision: int = 10,
         simulation_timeout_seconds: int = 10,
 ):
     """Computes a second-order model with SINDy-PI for the cascaded tanks data.
@@ -156,7 +158,7 @@ def main(
         feature_names=feature_names,
         differentiation_method=ps.FiniteDifference(drop_endpoints=True),
     )
-    model.fit(x_train, t=t, u=u_train)
+    model.fit(np.concatenate([x_train, u_train], axis=1))
 
     # 05 - Converting the implicit models to 2nd order explicit models via symbolic computation
     #   We are trying to solve for x_ddot as we assume we can control a second-order model
@@ -184,7 +186,7 @@ def main(
     ode_functions = []
     training_scores = []
     training_simulations = []
-    for expression in tqdm(symbolic_expressions, desc='Running simulations (training)...'):
+    for expression in tqdm(symbolic_expressions, desc='Running simulations (training)'):
         # We first have to convert the symbolic expression into a function that can be used for computation
         ode_fun = sp.lambdify([sp.symbols('xd'), sp.symbols('x'), sp.symbols('u')], expression)
         ode_functions.append(ode_fun)
@@ -196,6 +198,9 @@ def main(
         with TimeoutManager(seconds=simulation_timeout_seconds):
             try:
                 y_out = solve_ivp(training_ode, [0.0, tf], training_initial_conitions, t_eval=t)['y'].T
+                if y_out.shape[0] < t.shape[0]:
+                    warnings.warn('Simulation did not complete, padding with last value!')
+                    y_out = np.pad(y_out, ((0, t.shape[0] - y_out.shape[0]), (0, 0)), mode='edge')
                 y_sim = y_out[:, 1]
                 rmse = np.sqrt(np.mean((y_sim - training_y_true) ** 2))
             except TimeoutException:
@@ -232,9 +237,14 @@ def main(
 
     print(f'Test RMSE: {test_rmse:.3f} | Test R2: {100 * test_r2:.3f}%')
 
+    benchmark_data = pd.read_csv(os.path.join(root_path, 'data/Benchmarks/cascaded_tanks.csv'))
+
     plt.figure()
     plt.plot(t, rescale_factor * test_y_true, label='true', color='black', linewidth=2)
-    plt.plot(t, rescale_factor * y_sim, label=f'simulation', alpha=0.5)
+    plt.plot(t, rescale_factor * y_sim, label=f'simulation')
+    plt.plot(t, benchmark_data['ARX'], label='ARX')
+    plt.plot(t, benchmark_data['SINDy_prior'], label='SINDy_prior')
+    plt.plot(t, benchmark_data['SINDy_naif'], label='SINDy_naif')
     plt.ylim([-rescale_factor * 0.2, rescale_factor * 1.2])
     plt.legend()
     plt.show()
