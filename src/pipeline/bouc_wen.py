@@ -5,49 +5,39 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from typing import Tuple
+from typing import Tuple, Any
 from fire import Fire
 from pynumdiff.total_variation_regularization import jerk
 from scipy.integrate import solve_ivp
 from sklearn.metrics import r2_score
 
+
 from __init__ import root_path
+from src.utils.etl import prepare_data
+from src.utils.etl.bouc_wen import load_data
 
 
-# TODO: remove code duplication
-def compute_derivatives(
-        x: np.ndarray,
-        dt: float,
-        tvr_gamma: float = 10.0,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Computes the second derivative of the data x using TV regularization.
-    """
-    x_hat, x_dot = jerk(x, dt, params=[tvr_gamma])
-    _, x_ddot = jerk(x_dot, dt, params=[tvr_gamma])
-    return x_dot, x_ddot
+def ode_model(u: np.ndarray, t: np.ndarray, x_grad: Any, z_grad: Any):
+    # preparing the model for simulation
+    def mod(t_, xyz_):
+        [x_, y_, z_] = xyz_
+        u_ = np.interp(t_, t, u.ravel())
 
+        zd_ = z_grad.predict(np.array([[z_]]), u=np.array([[x_]])).ravel()[0]
+        # xd_ = (u_ - k * y_ - c * x_ - z_) / m
+        xd_ = x_grad.predict(np.array([[x_]]), u=np.array([[y_, z_, u_]])).ravel()[0]
+        yd_ = x_
 
-def prepare_data(
-        df: pd.DataFrame,
-        dt: float,
-        tvr_gamma: float = 1.0
-):
-    u = df['u'].values.reshape(-1, 1)
-    y = df['y'].values.reshape(-1, 1)
+        return np.array([xd_, yd_, zd_])
 
-    x, xd = compute_derivatives(y.ravel(), dt=dt, tvr_gamma=tvr_gamma)
-
-    return y, u, x.reshape(-1, 1), xd.reshape(-1, 1)
+    return mod
 
 
 def xdot_noz_model():
     """simple library consisting of a linear combination of inputs and state
     """
     feature_names = ['x', 'y', 'u']
-    function_names = functions = [lambda x: x]
-    lib = ps.CustomLibrary(
-        library_functions=functions,
-        function_names=function_names,
+    lib = ps.PolynomialLibrary(
         include_bias=False
     )
     optimizer = ps.STLSQ(threshold=0.00001, alpha=10.0)
@@ -63,7 +53,7 @@ def xdot_noz_model():
 def xdot_model():
     """simple library consisting of a linear combination of inputs and state
     """
-    feature_names = ['x', 'y', 'u', 'z']
+    feature_names = ['x', 'y', 'z', 'u']
     function_names = functions = [lambda x: x]
     lib = ps.CustomLibrary(
         library_functions=functions,
@@ -85,20 +75,16 @@ def zdot_simplified_model():
     """
     feature_names = ['z', 'x']
     functions = [
-        lambda _, x: x, # TODO: vedi cosa succede con lambda x: x...
-        # lambda z, x: z * x,
+        lambda _, x: x,     # TODO: vedi cosa succede con lambda x: x...
+        # lambda x: x,  # TODO: vedi cosa succede con lambda x: x...
         lambda z, x: z * np.abs(x),
-        lambda z, x: np.abs(z) * x,
-        # lambda z, x: np.abs(z) * np.abs(x),
-        # lambda z, x: z * np.abs(x),
+        lambda z, x: np.abs(z) * x
     ]
     function_names = [
         lambda _, x: x,
-        # lambda z, x: f'{z} * {x}',
+        # lambda x: x,
         lambda z, x: f'{z} * |{x}|',
-        lambda z, x: f'|{z}| * {x}',
-        # lambda z, x: f'|{z}| * |{x}|',
-        # lambda z, x: f'{z} * |{x}|',
+        lambda z, x: f'|{z}| * {x}'
     ]
     lib = ps.CustomLibrary(
         library_functions=functions,
@@ -175,7 +161,6 @@ def true_z_model(
     return grad_z
 
 def bouc_wen(
-        input_path: str = 'data/BoucWen/Train signals/train_data.csv',
         output_path: str = None,
         dt: float = 1 / 750.0,
         tvr_gamma: float = 0.000001,
@@ -183,214 +168,166 @@ def bouc_wen(
         thresholder: str = "l1",
         tol: float = 1e-6,
         max_iter: int = 50000,
+        training_samples: int = 1000,
+        validation_samples: int = 1000,
+        alternating_iterations: int = 1,
+        verbose: bool = True,
 ):
-    data = pd.read_csv(os.path.join(root_path, input_path))
-    # TODO: remove
-    data = data.iloc[:2000, :].copy()
+    # TODO: extract validation data
+    training_data, validation_data, test1_data, test2_data = load_data(
+        training_samples=training_samples,
+        validation_samples=validation_samples,
+    )
+    y_t, u_t, x_t, xd_t = prepare_data(training_data, dt=dt, tvr_gamma=tvr_gamma, derivation_order=2)
+    y_v, u_v, x_v, xd_v = prepare_data(validation_data, dt=dt, tvr_gamma=tvr_gamma, derivation_order=2)
+    t = np.arange(0, y_t.shape[0]) * dt
 
-    y, u, x, xd = prepare_data(data, dt=dt, tvr_gamma=tvr_gamma)
-    t = np.arange(0, y.shape[0]) * dt
-    # z = np.zeros_like(y)
-
+    # initial parameters and hidden state guess
     m, k, c = 2.0, 5e4, 10.0
-    z = u - k * y - c * x - m * xd
-    for i in range(10):
-        # m0, _ = xdot_noz_model()
-        # m0.fit(
-        #     x,
-        #     u=np.concatenate([y, u], axis=1),
-        #     x_dot=xd
-        # )
-        # m0.print()
-        # x_sim = m0.simulate(t=t, x0=x[0, :], u=np.concatenate([y, u], axis=1))
-        # x_sim = np.pad(x_sim.ravel(), (0, 1), mode='edge').reshape(-1, 1)
-        # x_sim_dot = jerk(x_sim.ravel(), dt, params=[tvr_gamma])[1].reshape(-1, 1)
-        # z_init = x_sim_dot - xd
-        # z_init_dot = jerk(z_init.ravel(), dt, params=[tvr_gamma])[1].reshape(-1, 1)
-        # z_pred = m0.predict(x, u=np.concatenate([y, u], axis=1)).reshape(-1, 1) - xd
-        # z_pred_dot = jerk(z_pred.ravel(), dt, params=[tvr_gamma])[1].reshape(-1, 1)
+    z = u_t - k * y_t - c * x_t - m * xd_t  # ==> xd = (u - k * y - c * x - z) / m
 
-        # zh, zd = jerk(z.ravel(), dt, params=[tvr_gamma])
-        # zh = zh.reshape(-1, 1)
-        # zd = zd.reshape(-1, 1)
-        zd = jerk(z.ravel(), dt, params=[tvr_gamma])[1].reshape(-1, 1)
+    # # simulating the linear model
+    # def linear_model(t_, xy_):
+    #     [x_, y_] = xy_
+    #     u_ = np.interp(t_, t, u.ravel())
+    #
+    #     xd_ = (u_ - k * y_ - c * x_) / m
+    #     yd_ = x_
+    #
+    #     return np.array([xd_, yd_])
+    #
+    # # zxy_lin = solve_ivp(linear_model, [0.0, t[-1]], [x[0, 0], y[0, 0]], t_eval=t)['y']
+    # # x_lin = zxy_lin[0, :].reshape(-1, 1)
+    # # y_lin = zxy_lin[1, :].reshape(-1, 1)
 
-        # grad_z = true_z_model(x, t)
-        # z_sol = solve_ivp(grad_z, [0.0, t[-1]], z[0, :], t_eval=np.linspace(0.0, t[-1], 20 * t.shape[0]))['y']
-        # z_sol = z_sol.ravel()[::20].reshape(-1, 1)
-        # # z_sol_dot = jerk(z_sol.ravel(), dt, params=[tvr_gamma])[1].reshape(-1, 1)
+    m0, _ = xdot_noz_model()
+    m0.fit(np.concatenate([x_t, y_t], axis=1), u=u_t, x_dot=np.concatenate([xd_t, x_t], axis=1))
 
+    if verbose:
+        print('SINDy base model:')
+        m0.print()
+    xy_sindy = m0.simulate(np.array([x_v[0, 0], y_v[0, 0]]), t, u=u_v)
+    x_sindy = np.pad(xy_sindy[:, 0], (0, 1), mode='edge').reshape(-1, 1)
+    y_sindy = np.pad(xy_sindy[:, 1], (0, 1), mode='edge').reshape(-1, 1)
+
+    upsample_factor = 20
+    grad_z = true_z_model(x_v, t)
+    z_hf = solve_ivp(grad_z, [0.0, t[-1]], [0.0], t_eval=np.linspace(0.0, t[-1], upsample_factor * t.shape[0]))['y']
+    z_hf = z_hf.ravel()[::upsample_factor].reshape(-1, 1)
+
+    # TODO: validate and save best at each iteration
+    # fitting the model for the hidden state
+    zc = z.copy()
+    z_full = x_full = y_full = None
+    m1 = m2 = None
+    m2_coef = None
+    for it in range(alternating_iterations):
+        if verbose:
+            print(f' Iteration {it+1} '.center(120, '='))
+
+        zd = jerk(zc.ravel(), dt, params=[tvr_gamma])[1].reshape(-1, 1)
         m1, _ = zdot_simplified_model()
-        m1.fit(
-            z,
-            # z_sol,
-            u=x,
-            # x_dot=z_sol_dot
-            x_dot=zd
-        )
-        # m1.fit(
-        #     # z_init,
-        #     z_pred,
-        #     u=x,
-        #     x_dot=z_pred_dot
-        #     # x_dot=z_init_dot
-        # )
-        m1.print()
+        m1.fit(zc, u=x_t, x_dot=zd)
 
-        z_new = np.pad(m1.simulate(t=t, x0=z[0, :], u=x).ravel(), (0, 1), mode='edge').reshape(-1, 1)
-
-        # _, (ax1, ax2) = plt.subplots(2, 1, sharex=True)
-        #
-        # ax1.plot(t, z, label='z')
-        # ax1.plot(t, zh, label='zh')
-        # ax1.plot(t, z_new, label='z_new')
-        # ax1.plot(t, z_sol, label='z_sol')
-        # # ax1.plot(t, z_init, label='z_init')
-        # ax1.plot(t, z_pred, label='z_pred')
-        # ax1.legend()
-        #
-        # ax2.plot(t, zd, label='zd')
-        # ax2.plot(t, z_sol_dot, label='z_sol_dot')
-        # ax2.legend()
-        #
-        # plt.show()
-        # # exit()
-
-
+        zs = m1.simulate(np.array([zc[0, 0]]), t, u=x_t)
+        zs = np.pad(zs.ravel(), (0, 1), mode='edge').reshape(-1, 1)
         m2, _ = xdot_model()
-        m2.fit(
-            np.concatenate([x, y], axis=1),
-            # WARNING
-            # u=np.concatenate([u, z_new], axis=1),
-            u=np.concatenate([u, z], axis=1),
-            x_dot=np.concatenate([xd, x], axis=1),
-        )
-        m2.print()
+        m2.fit(x_t, u=np.concatenate([y_t, zs, u_t], axis=1), x_dot=xd_t)
+        m2_coef = m2.coefficients().copy()
 
-        # WARNING
-        # sindy_sol = m2.simulate(t=t, x0=np.array([x[0, 0], y[0, 0]]), u=np.concatenate([u, z_new], axis=1))
-        sindy_sol = m2.simulate(t=t, x0=np.array([x[0, 0], y[0, 0]]), u=np.concatenate([u, z], axis=1))
-        x_sindy = np.pad(sindy_sol[:, 0], (0, 1), mode='edge').reshape(-1, 1)
-        y_sindy = np.pad(sindy_sol[:, 1], (0, 1), mode='edge').reshape(-1, 1)
+        zc = -1.0 * (xd_t - np.dot(np.concatenate([x_t, y_t, u_t], axis=1), m2_coef[:, (0, 1, 3)].T))
 
-        # TODO: simulate full model in open loop now...
-        # TODO: remove hardcoding
-        # TODO: automate eq. extraction
-        def final_model_lambdax(t_, zxy_):
-            # (z)' = -18.215 z + 48243.385 x + -429.901 z * |x| + 593.530 |z| * x
-            # (x)' = -0.323 x + -21251.107 y + 0.400 u + -0.644 z
-            # (y)' = 1.000 x
-            [z_, x_, y_] = zxy_
-            u_ = np.interp(t_, t, u.ravel())
+        if verbose:
+            print('-' * 120)
+            print('SINDy z model:')
+            m1.print()
+            m2.print()
+            print("(y)' = 1.000 x")
 
-            zd_ = -18.215 * z_ + 48243.385 * x_ - 429.901 * z_ * np.abs(x_) + 593.530 * np.abs(z_) * x_
-            xd_ = -0.323 * x_ - 21251.107 * y_ + 0.400 * u_ + -0.644 * z_
-            yd_ = 1.000 * x_
+    # preparing the model for simulation
+    full_model = ode_model(u_v, t, x_grad=m2, z_grad=m1)
 
-            return np.array([zd_, xd_, yd_])
+    # simulating
+    xyz_qs = solve_ivp(full_model, [0.0, t[-1]], [x_v[0, 0], y_v[0, 0], 0.0], t_eval=t)['y']
+    x_full = xyz_qs[0, :].reshape(-1, 1)
+    y_full = xyz_qs[1, :].reshape(-1, 1)
+    z_full = xyz_qs[2, :].reshape(-1, 1)
 
-        def final_model_narrow(t_, zxy_):
-            # (z)' = 47965.141 x + -538.060 z * |x| + 621.801 |z| * x
-            # (x)' = -6.452 x + -24279.075 y + 0.403 u + -0.585 z
-            # (y)' = 1.000 x
-            [z_, x_, y_] = zxy_
-            u_ = np.interp(t_, t, u.ravel())
+    # TODO: test on valid
+    if verbose:
+        print('=' * 120)
+        print(f'SINDy base model:')
+        print(f'\tR2: {100 * r2_score(y_v.ravel(), y_sindy.ravel()):.3f}%, RMSE: {np.sqrt(np.mean((y_v.ravel() - y_sindy.ravel()) ** 2)):.3e}')
+        print(f'SINDy z model:')
+        print(f'\tR2: {100 * r2_score(y_v.ravel(), y_full.ravel()):.3f}%, RMSE: {np.sqrt(np.mean((y_v.ravel() - y_full.ravel()) ** 2)):.3e}')
 
-            # TODO: change with model prediction from m1
-            zd_ = 47965.141 * x_ - 538.060 * z_ * np.abs(x_) + 621.801 * np.abs(z_) * x_
-            # xd_ = -6.452 * x_ - 24279.075 * y_ + 0.403 * u_ + -0.585 * z_
-            # yd_ = 1.000 * x_
+    # TODO: run model on test data and save metrics!
 
-            # (x)' = -5.000 x + -25000.000 y + 0.500 u + -0.500 z
-            # (y)' = 1.000 x
-            xd_ = -5.000 * x_ - 25000.000 * y_ + 0.500 * u_ + -0.500 * z_
-            yd_ = 1.000 * x_
+    _, (ax1, ax2, ax3) = plt.subplots(3, 1, sharex=True)
 
-            return np.array([zd_, xd_, yd_])
+    ax1.plot(t, z, label='z (estimated)')
+    ax1.plot(t, z_full, label='z (simulated)')
+    ax1.plot(t, z_hf, label='z (high fidelity)')
+    ax1.plot(t, zc, label='z (c)')
+    ax1.legend()
 
-        # zxy_sol = solve_ivp(final_model_lambdax, [0.0, t[-1]], [z[0, 0], x[0, 0], y[0, 0]], t_eval=t)['y']
-        zxy_sol = solve_ivp(final_model_narrow, [0.0, t[-1]], [z[0, 0], x[0, 0], y[0, 0]], t_eval=t)['y']
+    ax2.plot(t, x_v, label='x', zorder=4)
+    ax2.plot(t, x_full, label='x (simulated)', zorder=3)
+    ax2.plot(t, x_sindy, label='x (sindy)', zorder=2)
+    ax2.legend()
 
-        z_final = zxy_sol[0, :].reshape(-1, 1)
-        x_final = zxy_sol[1, :].reshape(-1, 1)
-        y_final = zxy_sol[2, :].reshape(-1, 1)
+    ax3.plot(t, y_v, label='y', zorder=4)
+    ax3.plot(t, y_full, label='y (simulated)', zorder=3)
+    ax3.plot(t, y_sindy, label='y (sindy)', zorder=2)
+    ax3.legend()
 
-        print(f'Simulation score: {100 * r2_score(y.ravel(), y_final.ravel()):.3f}%')
+    plt.show()
 
-        # _, (ax1, ax2, ax3, ax4) = plt.subplots(4, 1, sharex=True)
-        _, (ax1, ax3, ax4) = plt.subplots(3, 1, sharex=True)
+    # TODO: replicate hysteresis loop
+    # hysteresis loop plotting, i.e. restoring force vs. displacement
+    # xd_ = (u_ - k * y_ - c * x_ - z_) / m
 
-        ax1.plot(t, z, label='z')
-        # ax1.plot(t, zh, label='zh')
-        ax1.plot(t, z_new, label='z_new')
-        ax1.plot(t, z_final, label='z_fmod')
-        # ax1.plot(t, z_sol, label='z_sol')
-        ax1.legend()
+    n_qs = 5000
+    t_qs = np.arange(n_qs) * dt
+    # u_qs = 150.0 * np.concatenate(
+    #     [
+    #         1 - np.exp(- 1e-2 * t_qs[:n_qs // 2]),
+    #         2 * (np.exp(- 1e-2 * (t_qs[n_qs // 2:] - t_qs[n_qs // 2])) - 0.5)
+    #     ]
+    # ).reshape(-1, 1)
+    u_qs = 150.0 * np.sin(np.linspace(0.0, 2 * np.pi * dt * n_qs, n_qs)).reshape(-1, 1)
+    # u_qs = 10.0 * np.concatenate(
+    #     [
+    #         np.sin(np.linspace(0.0, 0.5 * np.pi, n_qs // 5)),
+    #         np.ones((n_qs // 5,)),
+    #         np.sin(np.linspace(0.5 * np.pi, 1.5 * np.pi, n_qs // 5)),
+    #         - 1.0 * np.ones((n_qs // 5,)),
+    #         np.sin(np.linspace(1.5 * np.pi, 2 * np.pi, n_qs // 5))
+    #     ]
+    # ).reshape(-1, 1)
+    qs_model = ode_model(u_qs, t_qs, x_grad=m2, z_grad=m1)
 
-        # ax2.plot(t, zd, label='zd')
-        # ax2.plot(t, z_sol_dot, label='z_sol_dot')
-        # ax2.legend()
+    # simulating
+    xyz_qs = solve_ivp(qs_model, [0.0, t_qs[-1]], [0.0, 0.0, 0.0], t_eval=t_qs)['y']
+    x_qs = xyz_qs[0, :].reshape(-1, 1)
+    y_qs = xyz_qs[1, :].reshape(-1, 1)
 
-        ax3.plot(t, x, label='x')
-        ax3.plot(t, x_sindy, label='x_sindy')
-        ax3.plot(t, x_final, label='x_fmod')
-        ax3.legend()
+    f = - 1.0 * jerk(x_qs.ravel(), dt, params=[tvr_gamma])[1].reshape(-1, 1) * m2_coef[0, -1] + u_qs
 
-        ax4.plot(t, y, label='y')
-        ax4.plot(t, y_sindy, label='y_sindy')
-        ax4.plot(t, y_final, label='y_fmod')
-        ax4.legend()
+    xy_sindy_qs = m0.simulate(np.array([0.0, 0.0]), t_qs, u=u_qs)
+    x_sindy_qs = np.pad(xy_sindy_qs[:, 0], (0, 1), mode='edge').reshape(-1, 1)
+    y_sindy_qs = np.pad(xy_sindy_qs[:, 1], (0, 1), mode='edge').reshape(-1, 1)
 
-        plt.show()
+    m0_coef = m0.coefficients().copy()
+    f_sindy = - 1.0 * jerk(x_sindy_qs.ravel(), dt, params=[tvr_gamma])[1].reshape(-1, 1) * m2_coef[0, 2] + u_qs
 
-        # ax = plt.figure().add_subplot(projection='3d')
-        # ax.plot(x.ravel(), y.ravel(), z.ravel(), label='original data')
-        # ax.plot(x_sindy.ravel(), y_sindy.ravel(), z_new.ravel(), label='sindy')
-        # ax.plot(x_final.ravel(), y_final.ravel(), z_final.ravel(), label='final model')
-        # ax.legend()
-        # plt.show()
-        #
-        # exit()
-        # c = m1.coefficients()[0, 1]
-        # k = m1.coefficients()[0, 2]
-        # m = 1.0 / m1.coefficients()[0, 3]
-        # c /= m
-        # k /= m
-
-
-
-    # m1, _ = xdot_model()
-    # m1.fit(x, u=np.concatenate([y, u], axis=1), x_dot=xd)
-    # m1.print()
-    #
-    # z = xd - np.dot(np.concatenate([x, y, u], axis=1), m1.coefficients().T)
-    # zd = jerk(z.ravel(), dt, params=[tvr_gamma])[1].reshape(-1, 1)
-    #
-    # m2, _ = zdot_model(nu=1.0)
-    # m2.fit(z, u=x, x_dot=zd)
-    # m2.print()
-    # z = m2.simulate(t=t, x0=[0.0], u=x)
-    # z = np.pad(z.ravel(), (0, 1), mode='edge').reshape(-1, 1)
-    # print(z)
-    # assert z.shape == z.shape
-    #
-    # m3, _ = xdot_model()
-    # m3.fit(x, u=np.concatenate([y, u, z], axis=1), x_dot=xd)
-    # m3.print()
-
-
-    # training_feats = np.concatenate([x, y], axis=1)
-    # model.fit(training_feats, u=u, x_dot=xd)
-    # model.print()
-    #
-    # # xd = -0.002 xdd + -112.039 x + 0.001 u
-    # z = x + 0.002 * xd + 112.039 * y - 0.001 * u
-    # z, z_dot = jerk(z.ravel(), dt, params=[tvr_gamma])
-    #
-    #
-    # # training_feats = np.concatenate([x_dot, z.reshape(-1, 1)], axis=1)
-    # model.fit(z.reshape(-1, 1), u=x, x_dot=z_dot)
-    # model.print()
+    plt.figure()
+    # plt.plot(y_qs, f, label='z model')
+    # plt.plot(y_sindy_qs, f_sindy, label='sindy model')
+    plt.plot(u_qs, y_qs, label='z model')
+    plt.plot(u_qs, y_sindy_qs, label='sindy model')
+    plt.legend()
+    plt.show()
 
 
 
