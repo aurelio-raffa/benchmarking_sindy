@@ -308,48 +308,6 @@ def bouc_wen(
         if show_plots:
             plt.show()
 
-    # n_qs = 5000
-    # t_qs = np.arange(n_qs) * dt
-    # # u_qs = 150.0 * np.concatenate(
-    # #     [
-    # #         1 - np.exp(- 1e-2 * t_qs[:n_qs // 2]),
-    # #         2 * (np.exp(- 1e-2 * (t_qs[n_qs // 2:] - t_qs[n_qs // 2])) - 0.5)
-    # #     ]
-    # # ).reshape(-1, 1)
-    # u_qs = 150.0 * np.sin(np.linspace(0.0, 2 * np.pi * dt * n_qs, n_qs)).reshape(-1, 1)
-    # # u_qs = 10.0 * np.concatenate(
-    # #     [
-    # #         np.sin(np.linspace(0.0, 0.5 * np.pi, n_qs // 5)),
-    # #         np.ones((n_qs // 5,)),
-    # #         np.sin(np.linspace(0.5 * np.pi, 1.5 * np.pi, n_qs // 5)),
-    # #         - 1.0 * np.ones((n_qs // 5,)),
-    # #         np.sin(np.linspace(1.5 * np.pi, 2 * np.pi, n_qs // 5))
-    # #     ]
-    # # ).reshape(-1, 1)
-    # qs_model = ode_model(u_qs, t_qs, x_grad=m2, z_grad=m1)
-    #
-    # # simulating
-    # xyz_qs = solve_ivp(qs_model, [0.0, t_qs[-1]], [0.0, 0.0, 0.0], t_eval=t_qs)['y']
-    # x_qs = xyz_qs[0, :].reshape(-1, 1)
-    # y_qs = xyz_qs[1, :].reshape(-1, 1)
-    #
-    # f = - 1.0 * jerk(x_qs.ravel(), dt, params=[tvr_gamma])[1].reshape(-1, 1) * m2_coef[0, -1] + u_qs
-    #
-    # xy_sindy_qs = m0.simulate(np.array([0.0, 0.0]), t_qs, u=u_qs)
-    # x_sindy_qs = np.pad(xy_sindy_qs[:, 0], (0, 1), mode='edge').reshape(-1, 1)
-    # y_sindy_qs = np.pad(xy_sindy_qs[:, 1], (0, 1), mode='edge').reshape(-1, 1)
-    #
-    # m0_coef = m0.coefficients().copy()
-    # f_sindy = - 1.0 * jerk(x_sindy_qs.ravel(), dt, params=[tvr_gamma])[1].reshape(-1, 1) * m2_coef[0, 2] + u_qs
-    #
-    # plt.figure()
-    # # plt.plot(y_qs, f, label='z model')
-    # # plt.plot(y_sindy_qs, f_sindy, label='sindy model')
-    # plt.plot(u_qs, y_qs, label='z model')
-    # plt.plot(u_qs, y_sindy_qs, label='sindy model')
-    # plt.legend()
-    # plt.show()
-
 
 if __name__ == '__main__':
     Fire(bouc_wen)
