@@ -1,9 +1,11 @@
+import json
 import warnings
 import os
 import hyperopt
 
 import numpy as np
 import matplotlib.pyplot as plt
+import pandas as pd
 
 from hyperopt import hp, fmin, tpe
 from fire import Fire
@@ -17,8 +19,7 @@ from src.utils.etl.bouc_wen import load_data
 from src.utils.model_selection.bouc_wen import train_and_validate_x_model, train_and_validate_z_model
 from src.utils.plotting.hysteresis_plot import hysteresis_plot
 from src.utils.plotting.trajectory_plot import trajectory_plot
-from src.utils.simulation.bouc_wen import simulate_test, high_fidelity, simulate_and_score_x_model, \
-    simulate_and_score_z_model
+from src.utils.simulation.bouc_wen import simulate_test, high_fidelity
 
 
 # TODO: save all outputs
@@ -154,30 +155,10 @@ def bouc_wen(
         **z_model_best_parameters
     )
 
-    # TODO: run model on test data and save metrics!
-    # 04 - Comparison on validation set
-    fig = trajectory_plot(
-        t_v,
-        u_v,
-        [x_v, x_z_mod, x_sindy],
-        [y_v, y_z_mod, y_sindy],
-        labels=['True', 'SINDy hidden', 'SINDy naive']
-    )
-    if output_path is not None:
-        fig.savefig(
-            os.path.join(
-                root_path,
-                output_path,
-                f'validation_trajectories.pdf'
-            ),
-            format="pdf",
-            bbox_inches="tight"
-        )
-    if show_plots:
-        plt.show()
-    plt.close(fig)
-
-    # 05 - Low-frequency excitation test
+    # 04 - Preparing test data
+    #   - Low-frequency simulation
+    #   - Multisine excitation
+    #   - Sine sweep excitation
     if verbose:
         print(f' Low-frequency excitation '.center(120, '='))
     n_low_freq = low_frequency_samples
@@ -190,67 +171,28 @@ def bouc_wen(
     y_low_freq = xyz_hf[1, :].reshape(-1, 1)
     xd_low_freq = compute_derivatives(x_low_freq.ravel(), dt=dt, tvr_gamma=tvr_gamma, order=1)[0].reshape(-1, 1)
 
-    print('Simulating SINDy naive model...')
-    x_sindy_low_freq, y_sindy_low_freq, sindy_r2_low_freq, sindy_rmse_low_freq = simulate_and_score_x_model(
-        m0, t_low_freq, u_low_freq, x_low_freq, y_low_freq
-    )
-    print('Simulating SINDy hidden model...')
-    x_hidden_low_freq, y_hidden_low_freq, _, hidden_r2_low_freq, hidden_rmse_low_freq = simulate_and_score_z_model(
-        m1, m2, t_low_freq, u_low_freq, x_low_freq, y_low_freq, xd_low_freq
-    )
+    y_test1, u_test1, x_test1, xd_test1 = prepare_data(test1_data, dt=dt, tvr_gamma=tvr_gamma, derivation_order=2)
+    y_test2, u_test2, x_test2, xd_test2 = prepare_data(test2_data, dt=dt, tvr_gamma=tvr_gamma, derivation_order=2)
 
-    if verbose:
-        print(f'SINDy naive model:')
-        print(f'\tR2: {100 * sindy_r2_low_freq:.3f}%, RMSE: {sindy_rmse_low_freq:.3e}')
-        print(f'SINDy hidden model:')
-        print(f'\tR2: {100 * hidden_r2_low_freq:.3f}%, RMSE: {hidden_rmse_low_freq:.3e}')
-
-    fig = trajectory_plot(
-        t_low_freq,
-        u_low_freq,
-        [x_low_freq, x_hidden_low_freq, x_sindy_low_freq],
-        [y_low_freq, y_hidden_low_freq, y_sindy_low_freq],
-        labels=['True', 'SINDy hidden', 'SINDy naive']
-    )
-
-    if output_path is not None:
-        fig.savefig(
-            os.path.join(
-                root_path,
-                output_path,
-                f'low_frequency_excitation_trajectories.pdf'
-            ),
-            format="pdf",
-            bbox_inches="tight"
-        )
-    if show_plots:
-        plt.show()
-    plt.close(fig)
-
-    fig = hysteresis_plot(
-        u_low_freq,
-        [y_low_freq, y_hidden_low_freq, y_sindy_low_freq],
-        labels=['True', 'SINDy hidden', 'SINDy naive']
-    )
-
-    if output_path is not None:
-        fig.savefig(
-            os.path.join(
-                root_path,
-                output_path,
-                f'low_frequency_excitation_hysteresis.pdf'
-            ),
-            format="pdf",
-            bbox_inches="tight"
-        )
-    if show_plots:
-        plt.show()
-
-    # 06 - Comparison on test data
-    for i, (test_data, test_name) in enumerate(zip([test1_data, test2_data], ['multisine', 'sinesweep'])):
+    # 05 - Comparison on test data
+    for i, ((y_test, u_test, x_test, xd_test), test_name) in enumerate(
+            zip(
+                [
+                    (y_low_freq, u_low_freq, x_low_freq, xd_low_freq),
+                    (y_test1, u_test1, x_test1, xd_test1),
+                    (y_test2, u_test2, x_test2, xd_test2)
+                ],
+                [
+                    'lowfrequency',
+                    'multisine',
+                    'sinesweep'
+                ]
+            )
+    ):
         if verbose:
             print(f' Test set "{test_name}" '.center(120, '='))
-        y_test, u_test, x_test, xd_test = prepare_data(test_data, dt=dt, tvr_gamma=tvr_gamma, derivation_order=2)
+
+        # running the simulation
         (
             t_test, x_sindy_test, y_sindy_test, x_hidden_test, y_hidden_test,
             sindy_r2_test, hidden_r2_test, sindy_rmse_test, hidden_rmse_test
@@ -260,12 +202,45 @@ def bouc_wen(
             dt=dt
         )
 
+        # saving the results
+        if output_path is not None:
+            test_outputs = pd.DataFrame(
+                np.concatenate(
+                    [x_test, y_test, u_test, x_sindy_test, y_sindy_test, x_hidden_test, y_hidden_test],
+                    axis=1
+                ),
+                columns=['x', 'y', 'u', 'x_naive', 'y_naive', 'x_hidden', 'y_hidden']
+            )
+            test_outputs.to_csv(
+                os.path.join(
+                    root_path,
+                    output_path,
+                    f'test_{test_name}_outputs.csv'
+                ),
+                index=False
+            )
+            with open(os.path.join(root_path, output_path, f'test_{test_name}_scores.json'), 'w') as handle:
+                json.dump(
+                    {
+                        'naive': {
+                            'r2': float(sindy_r2_test),
+                            'rmse': float(sindy_rmse_test)
+                        },
+                        'hidden': {
+                            'r2': float(hidden_r2_test),
+                            'rmse': float(hidden_rmse_test)
+                        }
+                    },
+                    handle
+                )
+
         if verbose:
             print(f'SINDy naive model:')
             print(f'\tR2: {100 * sindy_r2_test:.3f}%, RMSE: {sindy_rmse_test:.3e}')
             print(f'SINDy hidden model:')
             print(f'\tR2: {100 * hidden_r2_test:.3f}%, RMSE: {hidden_rmse_test:.3e}')
 
+        # plotting the trajectories
         fig = trajectory_plot(
             t_test,
             u_test,
@@ -288,6 +263,7 @@ def bouc_wen(
             plt.show()
         plt.close(fig)
 
+        # plotting the displacement vs input force
         fig = hysteresis_plot(
             u_test,
             [y_test, y_hidden_test, y_sindy_test],
