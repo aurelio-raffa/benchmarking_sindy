@@ -1,4 +1,5 @@
 import json
+import pickle
 import warnings
 import os
 import hyperopt
@@ -100,6 +101,10 @@ def bouc_wen(
         **x_model_best_parameters
     )
 
+    if output_path is not None:
+        with open(os.path.join(root_path, output_path, 'naive_model_m0.pkl'), 'wb') as handle:
+            pickle.dump(m0, handle)
+
     # 03 - Fitting the SINDy model for the hidden state
     def z_model_validation_rmse(params: dict):
         with warnings.catch_warnings():
@@ -154,6 +159,12 @@ def bouc_wen(
         verbose=verbose,
         **z_model_best_parameters
     )
+
+    if output_path is not None:
+        with open(os.path.join(root_path, output_path, 'hidden_model_m1.pkl'), 'wb') as handle:
+            pickle.dump(m1, handle)
+        with open(os.path.join(root_path, output_path, 'hidden_model_m2.pkl'), 'wb') as handle:
+            pickle.dump(m2, handle)
 
     # 04 - Preparing test data
     #   - Low-frequency simulation
