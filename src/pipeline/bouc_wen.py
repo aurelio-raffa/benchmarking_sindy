@@ -125,9 +125,9 @@ def bouc_wen(
     # Notice that it is also possible to tune parameter nu, which we do not do here
     rstate = np.random.Generator(np.random.PCG64(seed=seed))
     z_model_search_space = {
-        'm': hp.loguniform('m', np.log(1.9), np.log(2.1)),
-        'c': hp.loguniform('c', np.log(9.9), np.log(10.1)),
-        'k': hp.loguniform('k', np.log(5e4 - 1), np.log(5e4 + 1)),
+        'm': hp.loguniform('m', np.log(m_lb), np.log(m_ub)),
+        'c': hp.loguniform('c', np.log(k_lb), np.log(k_ub)),
+        'k': hp.loguniform('k', np.log(c_lb), np.log(c_ub)),
         'z_threshold': hp.loguniform('z_threshold', np.log(z_threshold_lb), np.log(z_threshold_ub))
     }
 
