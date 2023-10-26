@@ -161,8 +161,7 @@ def bouc_wen(
         u_v,
         [x_v, x_z_mod, x_sindy],
         [y_v, y_z_mod, y_sindy],
-        labels=['True', 'SINDy hidden', 'SINDy naive'],
-
+        labels=['True', 'SINDy hidden', 'SINDy naive']
     )
     if output_path is not None:
         fig.savefig(
@@ -211,7 +210,7 @@ def bouc_wen(
         u_low_freq,
         [x_low_freq, x_hidden_low_freq, x_sindy_low_freq],
         [y_low_freq, y_hidden_low_freq, y_sindy_low_freq],
-        labels=['True', 'SINDy hidden', 'SINDy naive'],
+        labels=['True', 'SINDy hidden', 'SINDy naive']
     )
 
     if output_path is not None:
@@ -231,7 +230,7 @@ def bouc_wen(
     fig = hysteresis_plot(
         u_low_freq,
         [y_low_freq, y_hidden_low_freq, y_sindy_low_freq],
-        labels=['True', 'SINDy hidden', 'SINDy naive'],
+        labels=['True', 'SINDy hidden', 'SINDy naive']
     )
 
     if output_path is not None:
@@ -272,7 +271,7 @@ def bouc_wen(
             u_test,
             [x_test, x_hidden_test, x_sindy_test],
             [y_test, y_hidden_test, y_sindy_test],
-            labels=['True', 'SINDy hidden', 'SINDy naive'],
+            labels=['True', 'SINDy hidden', 'SINDy naive']
         )
 
         if output_path is not None:
@@ -292,7 +291,7 @@ def bouc_wen(
         fig = hysteresis_plot(
             u_test,
             [y_test, y_hidden_test, y_sindy_test],
-            labels=['True', 'SINDy hidden', 'SINDy naive'],
+            labels=['True', 'SINDy hidden', 'SINDy naive']
         )
 
         if output_path is not None:
