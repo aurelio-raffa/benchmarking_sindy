@@ -23,8 +23,6 @@ from src.utils.plotting.trajectory_plot import trajectory_plot
 from src.utils.simulation.bouc_wen import simulate_test, high_fidelity
 
 
-# TODO: save all outputs
-# TODO: prepare directories for saving outputs
 def bouc_wen(
         output_path: str = 'outputs',
         dt: float = 1 / 750.0,
@@ -52,6 +50,10 @@ def bouc_wen(
 ):
     """Compares a SINDy naive model with a more sophisticated approach on the Bouc-Wen hysteresis benchmark.
     """
+    # 00 - Directory setup
+    if not os.path.isdir(os.path.join(root_path, output_path)):
+        os.makedirs(os.path.join(root_path, output_path), exist_ok=True)
+
     # 01 - Loading the data
     training_data, validation_data, test1_data, test2_data = load_data(
         training_samples=training_samples,
