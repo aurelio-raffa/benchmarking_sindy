@@ -1,4 +1,5 @@
 import warnings
+import os
 import hyperopt
 
 import numpy as np
@@ -6,21 +7,29 @@ import matplotlib.pyplot as plt
 
 from hyperopt import hp, fmin, tpe
 from fire import Fire
-from pynumdiff.total_variation_regularization import jerk
 from scipy.integrate import solve_ivp
+
+from __init__ import root_path
+from src.utils.preprocessing.compute_derivatives import compute_derivatives
 
 from src.utils.etl import prepare_data
 from src.utils.etl.bouc_wen import load_data
 from src.utils.model_selection.bouc_wen import train_and_validate_x_model, train_and_validate_z_model
-from src.utils.simulation.bouc_wen import ode_model
+from src.utils.plotting.hysteresis_plot import hysteresis_plot
+from src.utils.plotting.trajectory_plot import trajectory_plot
+from src.utils.simulation.bouc_wen import simulate_test, high_fidelity, simulate_and_score_x_model, \
+    simulate_and_score_z_model
 
 
+# TODO: save all outputs
+# TODO: prepare directories for saving outputs
 def bouc_wen(
-        output_path: str = None,
+        output_path: str = 'outputs',
         dt: float = 1 / 750.0,
         tvr_gamma: float = 0.000001,
         training_samples: int = 1000,
         validation_samples: int = 500,
+        low_frequency_samples: int = 1000,
         model_selection_trials: int = 10,
         alternating_iterations: int = 1,
         m_lb: float = 0.2,
@@ -36,6 +45,7 @@ def bouc_wen(
         alpha_lb: float = 1e-3,
         alpha_ub: float = 1e2,
         verbose: bool = True,
+        show_plots: bool = False,
         seed: int = 42,
 ):
     """Compares a SINDy naive model with a more sophisticated approach on the Bouc-Wen hysteresis benchmark.
@@ -115,12 +125,12 @@ def bouc_wen(
     # Notice that it is also possible to tune parameter nu, which we do not do here
     rstate = np.random.Generator(np.random.PCG64(seed=seed))
     z_model_search_space = {
-        'm': hp.loguniform('m', np.log(m_lb), np.log(m_ub)),
-        'c': hp.loguniform('c', np.log(c_lb), np.log(c_ub)),
-        'k': hp.loguniform('k', np.log(k_lb), np.log(k_ub)),
+        'm': hp.loguniform('m', np.log(1.9), np.log(2.1)),
+        'c': hp.loguniform('c', np.log(9.9), np.log(10.1)),
+        'k': hp.loguniform('k', np.log(5e4 - 1), np.log(5e4 + 1)),
         'z_threshold': hp.loguniform('z_threshold', np.log(z_threshold_lb), np.log(z_threshold_ub))
     }
-    
+
     if verbose:
         print(' Tuning SINDy hidden model '.center(120, '='))
     z_model_best_parameters = hyperopt.space_eval(
@@ -144,70 +154,201 @@ def bouc_wen(
         **z_model_best_parameters
     )
 
-    # 04 - Comparison
     # TODO: run model on test data and save metrics!
+    # 04 - Comparison on validation set
+    fig = trajectory_plot(
+        t_v,
+        u_v,
+        [x_v, x_z_mod, x_sindy],
+        [y_v, y_z_mod, y_sindy],
+        labels=['True', 'SINDy hidden', 'SINDy naive'],
 
-    _, (ax1, ax3) = plt.subplots(2, 1, sharex=True)
+    )
+    if output_path is not None:
+        fig.savefig(
+            os.path.join(
+                root_path,
+                output_path,
+                f'validation_trajectories.pdf'
+            ),
+            format="pdf",
+            bbox_inches="tight"
+        )
+    if show_plots:
+        plt.show()
+    plt.close(fig)
 
-    ax1.plot(t_v, x_v, label='x', zorder=4)
-    ax1.plot(t_v, x_z_mod, label='x (simulated)', zorder=3)
-    ax1.plot(t_v, x_sindy, label='x (sindy)', zorder=2)
-    ax1.legend()
+    # 05 - Low-frequency excitation test
+    if verbose:
+        print(f' Low-frequency excitation '.center(120, '='))
+    n_low_freq = low_frequency_samples
+    t_low_freq = np.arange(n_low_freq) * dt
+    u_low_freq = 150.0 * np.sin(np.linspace(0.0, 2 * np.pi * dt * n_low_freq, n_low_freq)).reshape(-1, 1)
+    hf_model = high_fidelity(t_low_freq, u_low_freq)
 
-    ax3.plot(t_v, y_v, label='y', zorder=4)
-    ax3.plot(t_v, y_z_mod, label='y (simulated)', zorder=3)
-    ax3.plot(t_v, y_sindy, label='y (sindy)', zorder=2)
-    ax3.legend()
+    xyz_hf = solve_ivp(hf_model, [0.0, t_low_freq[-1]], [0.0, 0.0, 0.0], t_eval=t_low_freq, method='LSODA')['y']
+    x_low_freq = xyz_hf[0, :].reshape(-1, 1)
+    y_low_freq = xyz_hf[1, :].reshape(-1, 1)
+    xd_low_freq = compute_derivatives(x_low_freq.ravel(), dt=dt, tvr_gamma=tvr_gamma, order=1)[0].reshape(-1, 1)
 
-    plt.show()
+    print('Simulating SINDy naive model...')
+    x_sindy_low_freq, y_sindy_low_freq, sindy_r2_low_freq, sindy_rmse_low_freq = simulate_and_score_x_model(
+        m0, t_low_freq, u_low_freq, x_low_freq, y_low_freq
+    )
+    print('Simulating SINDy hidden model...')
+    x_hidden_low_freq, y_hidden_low_freq, _, hidden_r2_low_freq, hidden_rmse_low_freq = simulate_and_score_z_model(
+        m1, m2, t_low_freq, u_low_freq, x_low_freq, y_low_freq, xd_low_freq
+    )
 
-    # TODO: load validation data
-    # TODO: replicate hysteresis loop
-    # hysteresis loop plotting, i.e. restoring force vs. displacement
-    # xd_ = (u_ - k * y_ - c * x_ - z_) / m
+    if verbose:
+        print(f'SINDy naive model:')
+        print(f'\tR2: {100 * sindy_r2_low_freq:.3f}%, RMSE: {sindy_rmse_low_freq:.3e}')
+        print(f'SINDy hidden model:')
+        print(f'\tR2: {100 * hidden_r2_low_freq:.3f}%, RMSE: {hidden_rmse_low_freq:.3e}')
 
-    n_qs = 5000
-    t_qs = np.arange(n_qs) * dt
-    # u_qs = 150.0 * np.concatenate(
-    #     [
-    #         1 - np.exp(- 1e-2 * t_qs[:n_qs // 2]),
-    #         2 * (np.exp(- 1e-2 * (t_qs[n_qs // 2:] - t_qs[n_qs // 2])) - 0.5)
-    #     ]
-    # ).reshape(-1, 1)
-    u_qs = 150.0 * np.sin(np.linspace(0.0, 2 * np.pi * dt * n_qs, n_qs)).reshape(-1, 1)
-    # u_qs = 10.0 * np.concatenate(
-    #     [
-    #         np.sin(np.linspace(0.0, 0.5 * np.pi, n_qs // 5)),
-    #         np.ones((n_qs // 5,)),
-    #         np.sin(np.linspace(0.5 * np.pi, 1.5 * np.pi, n_qs // 5)),
-    #         - 1.0 * np.ones((n_qs // 5,)),
-    #         np.sin(np.linspace(1.5 * np.pi, 2 * np.pi, n_qs // 5))
-    #     ]
-    # ).reshape(-1, 1)
-    qs_model = ode_model(u_qs, t_qs, x_grad=m2, z_grad=m1)
+    fig = trajectory_plot(
+        t_low_freq,
+        u_low_freq,
+        [x_low_freq, x_hidden_low_freq, x_sindy_low_freq],
+        [y_low_freq, y_hidden_low_freq, y_sindy_low_freq],
+        labels=['True', 'SINDy hidden', 'SINDy naive'],
+    )
 
-    # simulating
-    xyz_qs = solve_ivp(qs_model, [0.0, t_qs[-1]], [0.0, 0.0, 0.0], t_eval=t_qs)['y']
-    x_qs = xyz_qs[0, :].reshape(-1, 1)
-    y_qs = xyz_qs[1, :].reshape(-1, 1)
+    if output_path is not None:
+        fig.savefig(
+            os.path.join(
+                root_path,
+                output_path,
+                f'low_frequency_excitation_trajectories.pdf'
+            ),
+            format="pdf",
+            bbox_inches="tight"
+        )
+    if show_plots:
+        plt.show()
+    plt.close(fig)
 
-    f = - 1.0 * jerk(x_qs.ravel(), dt, params=[tvr_gamma])[1].reshape(-1, 1) * m2_coef[0, -1] + u_qs
+    fig = hysteresis_plot(
+        u_low_freq,
+        [y_low_freq, y_hidden_low_freq, y_sindy_low_freq],
+        labels=['True', 'SINDy hidden', 'SINDy naive'],
+    )
 
-    xy_sindy_qs = m0.simulate(np.array([0.0, 0.0]), t_qs, u=u_qs)
-    x_sindy_qs = np.pad(xy_sindy_qs[:, 0], (0, 1), mode='edge').reshape(-1, 1)
-    y_sindy_qs = np.pad(xy_sindy_qs[:, 1], (0, 1), mode='edge').reshape(-1, 1)
+    if output_path is not None:
+        fig.savefig(
+            os.path.join(
+                root_path,
+                output_path,
+                f'low_frequency_excitation_hysteresis.pdf'
+            ),
+            format="pdf",
+            bbox_inches="tight"
+        )
+    if show_plots:
+        plt.show()
 
-    m0_coef = m0.coefficients().copy()
-    f_sindy = - 1.0 * jerk(x_sindy_qs.ravel(), dt, params=[tvr_gamma])[1].reshape(-1, 1) * m2_coef[0, 2] + u_qs
+    # 06 - Comparison on test data
+    for i, (test_data, test_name) in enumerate(zip([test1_data, test2_data], ['multisine', 'sinesweep'])):
+        if verbose:
+            print(f' Test set "{test_name}" '.center(120, '='))
+        y_test, u_test, x_test, xd_test = prepare_data(test_data, dt=dt, tvr_gamma=tvr_gamma, derivation_order=2)
+        (
+            t_test, x_sindy_test, y_sindy_test, x_hidden_test, y_hidden_test,
+            sindy_r2_test, hidden_r2_test, sindy_rmse_test, hidden_rmse_test
+        ) = simulate_test(
+            y_test, u_test, x_test, xd_test,
+            m0, m1, m2,
+            dt=dt
+        )
 
-    plt.figure()
-    # plt.plot(y_qs, f, label='z model')
-    # plt.plot(y_sindy_qs, f_sindy, label='sindy model')
-    plt.plot(u_qs, y_qs, label='z model')
-    plt.plot(u_qs, y_sindy_qs, label='sindy model')
-    plt.legend()
-    plt.show()
+        if verbose:
+            print(f'SINDy naive model:')
+            print(f'\tR2: {100 * sindy_r2_test:.3f}%, RMSE: {sindy_rmse_test:.3e}')
+            print(f'SINDy hidden model:')
+            print(f'\tR2: {100 * hidden_r2_test:.3f}%, RMSE: {hidden_rmse_test:.3e}')
 
+        fig = trajectory_plot(
+            t_test,
+            u_test,
+            [x_test, x_hidden_test, x_sindy_test],
+            [y_test, y_hidden_test, y_sindy_test],
+            labels=['True', 'SINDy hidden', 'SINDy naive'],
+        )
+
+        if output_path is not None:
+            fig.savefig(
+                os.path.join(
+                    root_path,
+                    output_path,
+                    f'test_{test_name}_trajectories.pdf'
+                ),
+                format="pdf",
+                bbox_inches="tight"
+            )
+        if show_plots:
+            plt.show()
+        plt.close(fig)
+
+        fig = hysteresis_plot(
+            u_test,
+            [y_test, y_hidden_test, y_sindy_test],
+            labels=['True', 'SINDy hidden', 'SINDy naive'],
+        )
+
+        if output_path is not None:
+            fig.savefig(
+                os.path.join(
+                    root_path,
+                    output_path,
+                    f'test_{test_name}_hysteresis.pdf'
+                ),
+                format="pdf",
+                bbox_inches="tight"
+            )
+        if show_plots:
+            plt.show()
+
+    # n_qs = 5000
+    # t_qs = np.arange(n_qs) * dt
+    # # u_qs = 150.0 * np.concatenate(
+    # #     [
+    # #         1 - np.exp(- 1e-2 * t_qs[:n_qs // 2]),
+    # #         2 * (np.exp(- 1e-2 * (t_qs[n_qs // 2:] - t_qs[n_qs // 2])) - 0.5)
+    # #     ]
+    # # ).reshape(-1, 1)
+    # u_qs = 150.0 * np.sin(np.linspace(0.0, 2 * np.pi * dt * n_qs, n_qs)).reshape(-1, 1)
+    # # u_qs = 10.0 * np.concatenate(
+    # #     [
+    # #         np.sin(np.linspace(0.0, 0.5 * np.pi, n_qs // 5)),
+    # #         np.ones((n_qs // 5,)),
+    # #         np.sin(np.linspace(0.5 * np.pi, 1.5 * np.pi, n_qs // 5)),
+    # #         - 1.0 * np.ones((n_qs // 5,)),
+    # #         np.sin(np.linspace(1.5 * np.pi, 2 * np.pi, n_qs // 5))
+    # #     ]
+    # # ).reshape(-1, 1)
+    # qs_model = ode_model(u_qs, t_qs, x_grad=m2, z_grad=m1)
+    #
+    # # simulating
+    # xyz_qs = solve_ivp(qs_model, [0.0, t_qs[-1]], [0.0, 0.0, 0.0], t_eval=t_qs)['y']
+    # x_qs = xyz_qs[0, :].reshape(-1, 1)
+    # y_qs = xyz_qs[1, :].reshape(-1, 1)
+    #
+    # f = - 1.0 * jerk(x_qs.ravel(), dt, params=[tvr_gamma])[1].reshape(-1, 1) * m2_coef[0, -1] + u_qs
+    #
+    # xy_sindy_qs = m0.simulate(np.array([0.0, 0.0]), t_qs, u=u_qs)
+    # x_sindy_qs = np.pad(xy_sindy_qs[:, 0], (0, 1), mode='edge').reshape(-1, 1)
+    # y_sindy_qs = np.pad(xy_sindy_qs[:, 1], (0, 1), mode='edge').reshape(-1, 1)
+    #
+    # m0_coef = m0.coefficients().copy()
+    # f_sindy = - 1.0 * jerk(x_sindy_qs.ravel(), dt, params=[tvr_gamma])[1].reshape(-1, 1) * m2_coef[0, 2] + u_qs
+    #
+    # plt.figure()
+    # # plt.plot(y_qs, f, label='z model')
+    # # plt.plot(y_sindy_qs, f_sindy, label='sindy model')
+    # plt.plot(u_qs, y_qs, label='z model')
+    # plt.plot(u_qs, y_sindy_qs, label='sindy model')
+    # plt.legend()
+    # plt.show()
 
 
 if __name__ == '__main__':
