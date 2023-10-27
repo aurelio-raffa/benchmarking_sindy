@@ -1,8 +1,10 @@
 """Code based on https://pysindy.readthedocs.io/en/latest/examples/9_sindypi_with_sympy/example.html#Find-complex-PDE-with-SINDy-PI-with-PDE-functionality
 """
+import contextlib
 import warnings
 import os
 
+import hyperopt
 import numpy as np
 import pandas as pd
 import pysindy as ps
@@ -11,6 +13,7 @@ import sympy as sp
 
 from typing import Tuple
 from fire import Fire
+from hyperopt import hp, fmin, tpe
 from scipy.integrate import solve_ivp
 from pynumdiff.total_variation_regularization import jerk
 from scipy.optimize import minimize
@@ -28,14 +31,12 @@ from src.utils.preprocessing.compute_derivatives import compute_derivatives
 from src.utils.simulation.wrappers import simulation_wrapper
 from src.utils.functions import threshold
 from src.utils.simulation.models.tank_simulator import tank_simulator
+from src.utils.model_selection import *
 
 
 def score(x_true, x_sim):
     r2 = r2_score(x_true.ravel(), x_sim.ravel())
     rmse = np.sqrt(np.mean((x_true.ravel() - x_sim.ravel()) ** 2))
-
-    print(f'-> R2: {100 * r2:.2f}%')
-    print(f'-> RMSE: {rmse:.4f}')
 
     return r2, rmse
 
@@ -43,6 +44,7 @@ def score(x_true, x_sim):
 def get_model(
         model_type: str,
         order: int = 1,
+        **model_kwargs
 ):
     if order == 1:
         feature_names = ['x', 'u']
@@ -51,21 +53,25 @@ def get_model(
     else:
         raise ValueError(f'Possible valiues for "order" are 1 and 2!')
 
+    optimizer = ps.STLSQ(**model_kwargs)
+
     if model_type == 'naive':
         model = ps.SINDy(
-            feature_library=ps.PolynomialLibrary(),
-            feature_names=feature_names
+            feature_library=ps.PolynomialLibrary(include_bias=False),
+            feature_names=feature_names,
+            optimizer=optimizer
         )
     elif model_type == 'sqrt':
         sqrt_library = ps.CustomLibrary(
             library_functions=[lambda x: np.sqrt(np.where(x >= 0.0, x, 0.0))],
             function_names=[lambda x: f'sqrt(max({x}, 0))']
         )
-        poly_library = ps.PolynomialLibrary()
-        sindy_sqrt_library = ps.GeneralizedLibrary(libraries=[sqrt_library, poly_library])
+        poly_library = ps.PolynomialLibrary(include_bias=False)
+        sindy_sqrt_library = ps.GeneralizedLibrary(libraries=[poly_library, sqrt_library])
         model = ps.SINDy(
             feature_names=feature_names,
-            feature_library=sindy_sqrt_library
+            feature_library=sindy_sqrt_library,
+            optimizer=optimizer
         )
     else:
         raise NotImplementedError(f'Unknown model type: "{model_type}"!')
@@ -74,7 +80,7 @@ def get_model(
 
 
 def train_validate_model(
-        t: np.ndarray,
+        t_test: np.ndarray,
         x_train: np.ndarray,
         u_train: np.ndarray,
         x_dot_train: np.ndarray,
@@ -83,10 +89,13 @@ def train_validate_model(
         model_type: str,
         order: int = 1,
         x_ddot_train: np.ndarray = None,
-        integrator_kws: dict = None,
+        integrator_kws=None,
+        **model_kwargs
 ):
     # -> instantiating the model
-    model = get_model(model_type)
+    if integrator_kws is None:
+        integrator_kws = {}
+    model = get_model(model_type, order=order, **model_kwargs)
 
     # -> fitting
     if order == 1:
@@ -97,6 +106,9 @@ def train_validate_model(
             u=u_train,
             x_dot=np.concatenate([x_ddot_train, x_dot_train], axis=1)
         )
+        # forcing the first state to be the derivative of the second
+        model.model.steps[-1][1].coef_[1, :] = 0.0
+        model.model.steps[-1][1].coef_[1, 0] = 1.0
     else:
         raise ValueError(f'Possible valiues for "order" are 1 and 2!')
 
@@ -104,22 +116,22 @@ def train_validate_model(
     try:
         if order == 1:
             simulation = model.simulate(
-                x_test[0, :], t=t, u=u_test, integrator_kws=integrator_kws
+                x_test[0, :], t=t_test, u=u_test, integrator_kws=integrator_kws
             )
             simulation = np.pad(simulation.ravel(), (0, 1), 'edge').reshape(-1, order)
         else:
             simulation = model.simulate(
-                np.array([x_dot_train[0, 0], x_test[0, 0]]), t=t, u=u_test, integrator_kws=integrator_kws
+                np.array([x_dot_train[0, 0], x_test[0, 0]]), t=t_test, u=u_test, integrator_kws=integrator_kws
             )
             simulation = np.pad(simulation, ((0, 1), (0, 0)), 'edge').reshape(-1, order)
     except Exception as e:
         warnings.warn(f'SINDy naive model failed ({type(e).__name__}: {e}), returning NaNs...')
-        simulation = np.ones((t.shape[0], order)) * np.nan
+        simulation = np.ones((t_test.shape[0], order)) * np.nan
 
-    if simulation.shape[0] != t.shape[0]:
+    if simulation.shape[0] != t_test.shape[0]:
         simulation = np.pad(
             simulation,
-            ((0, t.shape[0] - simulation.shape[0]), (0, 0)),
+            ((0, t_test.shape[0] - simulation.shape[0]), (0, 0)),
             mode='constant',
             constant_values=np.nan
         )
@@ -142,112 +154,104 @@ def cascaded_tanks(
     max_val = 10.0 / rescale_factor
 
     # 01 - Loading the data
-    train_data, test_data, t, dt, tf = load_data()
+    # TODO: extract validation data to perform HPO
+    train_data, validation_data, test_data, dt, t_train, t_val, t_test = load_data()
 
     # TODO: rescale back when saving the results
     # 01b - Rescaling the data (for numerical stability)
     train_data /= rescale_factor
+    validation_data /= rescale_factor
     test_data /= rescale_factor
 
     # 02 - Computing the derivatives (using TV regularization) and preparing the dataset
     x_train, u_train, x_dot_train, x_ddot_train = prepare_data(
         train_data, dt=dt, tvr_gamma=tvr_gamma, derivation_order=2
     )
+    x_val, u_val, x_dot_val, x_ddot_val = prepare_data(
+        validation_data, dt=dt, tvr_gamma=tvr_gamma, derivation_order=2
+    )
     x_test, u_test, x_dot_test, x_ddot_test = prepare_data(
         test_data, dt=dt, tvr_gamma=tvr_gamma, derivation_order=2
     )
 
     # 03 - Training the models
-    # 03a - Naive SINDy
-    print(' Naive SINDy '.center(120, '='))
-    naive_sindy = ps.SINDy(
-        feature_library=ps.PolynomialLibrary(),
-        feature_names=['x', 'u']
-    )
-
-    # -> fitting
-    naive_sindy.fit(x_train, u=u_train, x_dot=x_dot_train)
-
-    # -> printing
-    print('Equations:')
-    naive_sindy.print()
-
-    # -> simulating
-    naive_sindy_sim = naive_sindy.simulate(x_test[0, :], t=t, u=u_test)
-    naive_sindy_sim = np.pad(naive_sindy_sim.ravel(), (0, 1), 'edge')
-
-    # -> scoring
-    score(x_test, naive_sindy_sim)
-
-    # 03b - SINDy with sqrt nonlinearities
-    print(' SINDy, Square-root nonlinearities '.center(120, '='))
-    sqrt_library = ps.CustomLibrary(
-        library_functions=[
-            lambda x: np.sqrt(np.where(x >= 0.0, x, 0.0))
-        ],
-        function_names=[
-            lambda x: f'sqrt(max({x}, 0))'
-        ]
-    )
-    poly_library = ps.PolynomialLibrary()
-    sindy_sqrt_library = ps.GeneralizedLibrary(libraries=[sqrt_library, poly_library])
-    sindy_sqrt = ps.SINDy(
-        feature_names=['x', 'u'],
-        feature_library=sindy_sqrt_library
-    )
-
-    # -> fitting
-    sindy_sqrt.fit(x_train, u=u_train, x_dot=x_dot_train)
-
-    # -> printing
-    print('Equations:')
-    sindy_sqrt.print()
-
-    # -> simulating
-    sindy_sqrt_sim = sindy_sqrt.simulate(x_test[0, :], t=t, u=u_test)
-    sindy_sqrt_sim = np.pad(sindy_sqrt_sim.ravel(), (0, 1), 'edge')
-
-    # -> scoring
-    score(x_test, sindy_sqrt_sim)
-
-    # 03c - SINDy second order
-    print(' SINDy, second order '.center(120, '='))
-    sindy_sqrt_library = ps.GeneralizedLibrary(libraries=[sqrt_library, poly_library])
-    sindy_second_order = ps.SINDy(
-        feature_library=sindy_sqrt_library,
-        feature_names=['xd', 'x', 'u']
-    )
-
-    # -> fitting
-    sindy_second_order.fit(
-        np.concatenate([x_dot_train, x_train], axis=1),
-        u=u_train,
-        x_dot=np.concatenate([x_ddot_train, x_dot_train], axis=1)
-    )
-
-    # -> printing
-    print('Equations:')
-    sindy_second_order.print()
-
-    # -> simulating
-    sindy_second_order_sim = sindy_second_order.simulate(
-        np.array([x_dot_train[0, 0], x_test[0, 0]]), t=t, u=u_test,
-        integrator_kws={"method": "RK45"}
-    )[1, :]
-    sindy_second_order_sim = np.pad(sindy_second_order_sim.ravel(), (0, 1), 'edge')
-
-    # -> scoring
-    score(x_test, sindy_second_order_sim)
-
-    # TODO: move to the end
-    # -> plotting
     plt.figure()
-    plt.plot(t, x_test, label='True')
-    plt.plot(t, naive_sindy_sim, label='Naive SINDy')
-    plt.plot(t, sindy_sqrt_sim, label='SINDy SQRT')
-    plt.plot(t, sindy_second_order_sim, label='SINDy 2nd order')
+    plt.plot(t_test, x_test, label='True')
+    for readable_name, model_type, order, integrator_kws in zip(
+            ['Naive SINDy', 'SINDy SQRT', 'SINDy 2nd order', 'SINDy 2nd order, SQRT'],
+            ['naive', 'sqrt', 'naive', 'sqrt'],
+            [1, 1, 2, 2],
+            [{}, {}, {'method': 'Radau'}, {'method': 'Radau'}]
+    ):
+        print(f' {readable_name} '.center(120, '='))
+
+        def validation_rmse(params: dict):
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')
+                with contextlib.redirect_stderr(open(os.devnull, 'w')):
+
+                    val_rmse = train_validate_model(
+                        t_test=t_val,
+                        x_train=x_train,
+                        u_train=u_train,
+                        x_dot_train=x_dot_train,
+                        x_test=x_val,
+                        u_test=u_val,
+                        x_ddot_train=x_ddot_train,
+                        model_type=model_type,
+                        order=order,
+                        integrator_kws=integrator_kws,
+                        **params
+                    )[-1]
+
+            return val_rmse
+
+        # Hyperparameter tuning
+        rstate = np.random.Generator(np.random.PCG64(seed=42))
+        search_space = {
+            'alpha': hp.loguniform('alpha', np.log(1e-3), np.log(1e3)),
+            'threshold': hp.loguniform('threshold', np.log(1e-1), np.log(1e1))
+        }
+
+        best_parameters = hyperopt.space_eval(
+            search_space,
+            fmin(
+                fn=validation_rmse,
+                space=search_space,
+                algo=tpe.suggest,
+                max_evals=100,
+                rstate=rstate
+            )
+        )
+
+        # TODO: save outputs
+        # Fitting
+        model, simulation, r2, rmse = train_validate_model(
+            t_test=t_test,
+            x_train=x_train,
+            u_train=u_train,
+            x_dot_train=x_dot_train,
+            x_test=x_test,
+            u_test=u_test,
+            x_ddot_train=x_ddot_train,
+            model_type=model_type,
+            order=order,
+            integrator_kws=integrator_kws,
+            **best_parameters
+        )
+        model.print()
+        print(' Scores: '.center(120, '-'))
+        print(f'-> R2: {100 * r2:.2f}%')
+        print(f'-> RMSE: {rmse:.4f}')
+
+        plt.plot(t_test, simulation[:, -1], label=readable_name)
+
+
+
     plt.legend()
     plt.show()
+
+
 
 
 if __name__ == '__main__':
