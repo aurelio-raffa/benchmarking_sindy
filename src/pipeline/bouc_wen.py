@@ -1,3 +1,4 @@
+import contextlib
 import json
 import pickle
 import warnings
@@ -68,12 +69,14 @@ def bouc_wen(
     def x_model_validation_rmse(params: dict):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            val_rmse = train_and_validate_x_model(
-                t_t, y_t, x_t, u_t, xd_t,
-                t_v, y_v, x_v, u_v, xd_v,
-                verbose=False,
-                **params
-            )[3]
+            with contextlib.redirect_stderr(open(os.devnull, 'w')):
+
+                val_rmse = train_and_validate_x_model(
+                    t_t, y_t, x_t, u_t, xd_t,
+                    t_v, y_v, x_v, u_v, xd_v,
+                    verbose=False,
+                    **params
+                )[3]
 
         return val_rmse
 
@@ -111,15 +114,16 @@ def bouc_wen(
     def z_model_validation_rmse(params: dict):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            val_rmse = train_and_validate_z_model(
-                t_t, y_t, x_t, u_t, xd_t,
-                t_v, y_v, x_v, u_v, xd_v,
-                alternating_iterations=alternating_iterations,
-                tvr_gamma=tvr_gamma,
-                dt=dt,
-                verbose=False,
-                **params
-            )[6]
+            with contextlib.redirect_stderr(open(os.devnull, 'w')):
+                val_rmse = train_and_validate_z_model(
+                    t_t, y_t, x_t, u_t, xd_t,
+                    t_v, y_v, x_v, u_v, xd_v,
+                    alternating_iterations=alternating_iterations,
+                    tvr_gamma=tvr_gamma,
+                    dt=dt,
+                    verbose=False,
+                    **params
+                )[6]
 
         return val_rmse
 
