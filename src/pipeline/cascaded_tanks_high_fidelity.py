@@ -15,9 +15,10 @@ from scipy.integrate import solve_ivp
 from pynumdiff.total_variation_regularization import jerk
 from sklearn.metrics import r2_score
 from tqdm import tqdm
+from scipy.optimize import minimize, LinearConstraint
 
 from __init__ import root_path
-from src.utils.import_cascaded_tanks_data import import_cascaded_tanks_data
+from src.utils.etl.cascaded_tanks import import_cascaded_tanks_data
 from src.utils.symbolic_conversion import prepare_for_sympy
 from src.utils.timeout import TimeoutException, timeout_handler, TimeoutManager
 
@@ -42,11 +43,6 @@ def prepare_data(
     u = df['u'].values.reshape(-1, 1)
     y = df['y'].values
 
-    plt.figure()
-    plt.plot(y, label='y')
-    plt.plot(u, label='u')
-    plt.legend()
-    plt.show()
     x_dot, x_ddot = compute_derivatives(y, dt=dt, tvr_gamma=tvr_gamma)
     x = np.concatenate(
         [
@@ -108,6 +104,62 @@ def main(
     # 02 - Computing the derivatives (using TV regularization) and preparing the dataset
     x_train, u_train = prepare_data(train_data, dt=dt, tvr_gamma=tvr_gamma)
     x_test, u_test = prepare_data(test_data, dt=dt, tvr_gamma=tvr_gamma)
+
+    def high_fidelity_model(params, eps: float = 1e-5, plot: bool = False):
+        x1_0, k1, k2, k3, k4, gamma = params
+
+        def cascade(t_, x_):
+            x1, x2 = x_
+            u = np.interp(t_, t, u_train.ravel())
+            x1_dot = - k1 * np.power(np.abs(x1), gamma) + k4 * u
+            if x1 < eps:
+                x1_dot = max(x1_dot, 0.0)
+            elif x1 > 1.0 - eps:
+                x1_dot = min(x1_dot, 0.0)
+            x2_dot = - k2 * np.power(np.abs(x2), gamma) + k3 * np.power(np.abs(x1), gamma)
+            if x2 < eps:
+                x2_dot = max(x1_dot, 0.0)
+            elif x2 > 1.0 - eps:
+                x2_dot = min(x1_dot, 0.0)
+            return np.array([x1_dot, x2_dot])
+
+        x2_true = train_data['y'].values
+        x2_0 = x2_true[0]
+
+        x1x2 = solve_ivp(cascade, [0.0, tf], np.array([x1_0, x2_0]), t_eval=t)['y'].T
+        x1_sim = x1x2[:, 0]
+        x2_sim = x1x2[:, 1]
+
+        if plot:
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 10), sharex=True)
+            ax1.plot(t, x1_sim, label='sim')
+            ax2.plot(t, x2_sim, label='sim')
+            ax2.plot(t, x2_true, label='true')
+            ax1.legend()
+            ax2.legend()
+            plt.show()
+
+        mse = np.mean((x2_sim - x2_true) ** 2)
+
+        return mse
+
+    A = np.eye(6, 6)
+    lb = np.zeros((6, ))
+    ub = np.ones((6, ))
+    ub[1:] = np.inf
+    constraints = LinearConstraint(A, lb=lb, ub=ub, keep_feasible=False)
+    # init = np.array([8.90048228e-04, 3.16837848e+00, 7.75406631e-01, 6.92661617e+00])
+    init = np.array([0.4, 17.0, 31.5, 29, 45.0, 0.7])
+    high_fidelity_model(init, plot=True)
+    res = minimize(
+        high_fidelity_model,
+        init,
+        method='SLSQP',
+        constraints=constraints
+    )
+    print(res)
+    high_fidelity_model(res.x, plot=True)
+    exit()
 
     # 03 - Definition of the library of functions to be applied to the data
     #   The library is created so as to contain only the candidate terms that we know must enter in the 2nd order model.
