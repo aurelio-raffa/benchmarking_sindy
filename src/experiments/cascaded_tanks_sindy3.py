@@ -325,7 +325,7 @@ def main(
         simulation_timeout_seconds=simulation_timeout_seconds
     )
     print(model_equation)
-    print(f'final score: {score}')
+    print(f'final score_simulation: {score}')
     print(f'r2: {r2_score(x_train.ravel(), simulation.ravel())}')
 
     plt.plot(t, x_train, label='true')
