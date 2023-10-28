@@ -1,6 +1,5 @@
 """Code based on https://pysindy.readthedocs.io/en/latest/examples/9_sindypi_with_sympy/example.html#Find-complex-PDE-with-SINDy-PI-with-PDE-functionality
 """
-import warnings
 import os
 
 import numpy as np
@@ -13,16 +12,13 @@ from typing import Tuple
 from fire import Fire
 from scipy.integrate import solve_ivp
 from pynumdiff.total_variation_regularization import jerk
-from scipy.optimize import minimize
-from sklearn.linear_model import LinearRegression
 from sklearn.metrics import r2_score
-from sklearn.preprocessing import StandardScaler
-from tqdm import tqdm
 
 from __init__ import root_path
 from src.utils.import_cascaded_tanks_data import import_cascaded_tanks_data
-from src.utils.symbolic_conversion import prepare_for_sympy
-from src.utils.timeout import TimeoutException, timeout_handler, TimeoutManager
+
+from src.utils.model_selection.cascaded_tanks import simulate_and_select
+from src.utils.simulation.cascaded_tanks import prepare_for_simulation
 
 
 def compute_derivatives(
@@ -61,100 +57,6 @@ def prepare_data(
     # )
 
     return y, u, x_dot.reshape(-1, 1)
-
-
-def prepare_for_simulation(
-        ode_fun: callable,
-        t: np.ndarray,
-        z: np.ndarray,
-        u: np.ndarray,
-):
-    """Wraps a function into a format that can be used for simulation with solve_ivp.
-    Notice that the time span and control input are fixed and have to be provided prior to simulation.
-    """
-
-    def ode_wrapper(t_, x_):
-        # t_ is a scalar and we need to use it to interpolate the control input
-        z_ = np.interp(t_, t, z.ravel())
-        u_ = np.interp(t_, t, u.ravel())
-
-        # The second derivative is computed by calling the ode_fun
-        x_d = ode_fun(x_, z_, u_)
-
-        # We return the state's second and first derivatives in this order
-        return np.array([x_d])
-
-    return ode_wrapper
-
-
-def simulate_and_select(
-        model,
-        t: np.ndarray,
-        tf: float,
-        z_train: np.ndarray,
-        u_train: np.ndarray,
-        training_feats: np.ndarray,
-        precision: int = 10,
-        simulation_timeout_seconds: int = 10
-):
-    # 05 - Converting the implicit models to 2nd order explicit models via symbolic computation
-    #   We are trying to solve for x_ddot as we assume we can control a second-order model
-    model_equations = model.equations(precision=precision)
-    model_features = list(np.copy(model.get_feature_names()))
-    symbolic_expressions = []
-    transformed_equations = []
-    for i, (lhs, rhs) in enumerate(zip(model_features, model_equations)):
-        fixed_rhs = prepare_for_sympy(rhs)
-        print(f'original equation: {lhs} =\n\t= {fixed_rhs}')
-        try:
-            [symbolic_expression] = sp.solve(sp.Eq(sp.sympify(lhs), sp.sympify(fixed_rhs)), sp.symbols('xd'))
-            symbolic_expressions.append(symbolic_expression)
-            transformed_equations.append(f'xd = {symbolic_expression}')
-            print(f'...solved\n')
-        except Exception as e:
-            warnings.warn(f'Failed to solve equation {i} ({type(e).__name__}: {str(e)})!')
-            continue
-
-    # 06 - Model selection
-    #   We simulate the models obtained by the previous stage on the training trajectory and select the best one in
-    #   terms of RMSE.
-    training_initial_conitions = training_feats[0, 1:2].copy()
-    training_y_true = training_feats[:, 1].copy()
-    ode_functions = []
-    training_scores = []
-    training_simulations = []
-    for expression in tqdm(symbolic_expressions, desc='Running simulations (training)'):
-        # We first have to convert the symbolic expression into a function that can be used for computation
-        ode_fun = sp.lambdify([sp.symbols('x'), sp.symbols('z'), sp.symbols('u')], expression)
-        ode_functions.append(ode_fun)
-
-        # We prepare to run the simulation
-        training_ode = prepare_for_simulation(ode_fun, t=t, z=z_train, u=u_train)
-
-        # We run the simulation with a timeout manager so that unreasonably long simulations will be interrupted
-        with TimeoutManager(seconds=simulation_timeout_seconds):
-            try:
-                y_out = solve_ivp(training_ode, [0.0, tf], training_initial_conitions, t_eval=t)['y'].T
-                if y_out.shape[0] < t.shape[0]:
-                    warnings.warn('Simulation did not complete, padding with last value!')
-                    y_out = np.pad(y_out, ((0, t.shape[0] - y_out.shape[0]), (0, 0)), mode='edge')
-                y_sim = y_out[:, 0]
-                mse = np.mean((y_sim - training_y_true) ** 2)
-            except TimeoutException:
-                warnings.warn('Simulation timed out, returning zeros!')
-                y_sim = np.nan * np.ones((t.shape[0],))
-                mse = np.inf
-
-        training_simulations.append(y_sim)
-        training_scores.append(mse)
-
-    # We select the best model based on the RMSE
-    best_model_idx = np.argmin(training_scores)
-    best_score = training_scores[best_model_idx]
-    best_model = symbolic_expressions[best_model_idx]
-    best_sim = training_simulations[best_model_idx]
-
-    return best_score, best_sim, best_model
 
 
 rescale_factor: float = 10.0
