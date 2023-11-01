@@ -1,7 +1,6 @@
-import numpy as np
 import pysindy as ps
 
-from src.utils.functions import threshold
+from src.utils.functions import thresholded_sqrt, thresholded_sqrt_name
 
 
 def get_model(
@@ -33,8 +32,8 @@ def get_model(
         )
     elif model_type == 'sqrt' or model_type == 'sqrt_poly':
         sqrt_library = ps.CustomLibrary(
-            library_functions=[lambda x: np.sqrt(threshold(x))],
-            function_names=[lambda x: f'sqrt({x})']
+            library_functions=[thresholded_sqrt],
+            function_names=[thresholded_sqrt_name]
         )
         if model_type == 'sqrt':
             linear_library = ps.PolynomialLibrary(include_bias=False, degree=1)
