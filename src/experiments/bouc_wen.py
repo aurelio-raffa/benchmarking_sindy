@@ -16,6 +16,8 @@ from fire import Fire
 from scipy.integrate import solve_ivp
 
 from __init__ import root_path
+from src.utils.benchmarking.bouc_wen import load_benchmarks
+from src.utils.model_selection import score_simulation
 from src.utils.plotting import set_font
 from src.utils.preprocessing.compute_derivatives import compute_derivatives
 
@@ -52,7 +54,7 @@ def bouc_wen(
         alpha_lb: float = 1e-3,
         alpha_ub: float = 1e2,
         verbose: bool = True,
-        show_plots: bool = False,
+        show_plots: bool = True,
         seed: int = 42,
 ):
     """Compares a SINDy naive model with a more sophisticated approach on the Bouc-Wen hysteresis benchmark.
@@ -66,6 +68,8 @@ def bouc_wen(
         training_samples=training_samples,
         validation_samples=validation_samples,
     )
+    # loading the benchmark signals
+    narx_benchmarks = load_benchmarks()
 
     # 02 - Naive SINDy model
     def x_model_validation_rmse(params: dict):
@@ -203,6 +207,27 @@ def bouc_wen(
     xyz_hf = solve_ivp(hf_model, [0.0, t_low_freq[-1]], [0.0, 0.0, 0.0], t_eval=t_low_freq, method='LSODA')['y']
     x_low_freq = xyz_hf[0, :].reshape(-1, 1)
     y_low_freq = xyz_hf[1, :].reshape(-1, 1)
+
+    low_frequency_simulation = pd.DataFrame(
+        np.concatenate(
+            [u_low_freq, y_low_freq, x_low_freq],
+            axis=1
+        ),
+        columns=[
+            'u',
+            'y',
+            'x',
+        ]
+    )
+    low_frequency_simulation.to_csv(
+        os.path.join(
+            root_path,
+            output_path,
+            f'test_low_frequency.csv'
+        ),
+        index=False
+    )
+
     xd_low_freq = compute_derivatives(x_low_freq.ravel(), dt=dt, tvr_gamma=tvr_gamma, order=1)[0].reshape(-1, 1)
 
     # 05 - Comparison on test data
@@ -222,8 +247,26 @@ def bouc_wen(
                 ]
             )
     ):
+        narx_data = None
         if verbose:
             print(f' Testing on set "{test_name}" '.center(120, '='))
+        if test_name in narx_benchmarks:
+            # adding narx
+            narx_data = np.pad(
+                narx_benchmarks[test_name].ravel(), (x_test.shape[0] - narx_benchmarks[test_name].shape[0], 0),
+                mode='constant', constant_values=np.nan
+            ).reshape(-1, 1)
+
+            benchmark_scores = dict(
+                zip(
+                    ['r2', 'rmse'], score_simulation(
+                        y_test[~np.isnan(narx_data[:, 0]), :],
+                        narx_data[~np.isnan(narx_data[:, 0]), :]
+                    )
+                )
+            )
+        else:
+            benchmark_scores = {}
 
         # running the simulation
         t_test, x_sim_test, y_sim_test, r2_test, rmse_test = simulate_test(
@@ -255,6 +298,7 @@ def bouc_wen(
                 ),
                 index=False
             )
+
             with open(os.path.join(root_path, output_path, f'test_{test_name}_scores.json'), 'w') as handle:
                 json.dump(
                     {
@@ -267,7 +311,8 @@ def bouc_wen(
                                 'r2': float(r2_test[j + 1]),
                                 'rmse': float(rmse_test[j + 1])
                             } for j, n in enumerate(hidden_models.keys())
-                        }
+                        },
+                        **benchmark_scores
                     },
                     handle
                 )
@@ -278,13 +323,22 @@ def bouc_wen(
             for j, n in enumerate(hidden_models.keys()):
                 print(f'SINDy hidden {n} model:')
                 print(f'\tR2: {100 * r2_test[j + 1]:.3f}%, RMSE: {rmse_test[j + 1]:.3e}')
+                if test_name in narx_benchmarks:
+                    print(f'NARX:')
+                    print(f'\tR2: {100 * benchmark_scores["r2"]:.3f}%, RMSE: {benchmark_scores["rmse"]:.3e}')
 
         # plotting the trajectories
         plot_labels = ['True', 'SINDy', *[f'Hidden SINDy, {n}' for n in hidden_models.keys()]]
+        plot_trajectories = [y_test, *y_sim_test]
+        if test_name in narx_benchmarks:
+            plot_labels.append('NARX')
+            plot_trajectories.append(narx_data)
+
         set_font(publish=bool(os.getenv('PUBLISH')))
+        t_test = np.arange(0, y_test.shape[0]) * dt
         fig = trajectory_plot(
             t=t_test,
-            xs=[y_test, *y_sim_test],
+            xs=plot_trajectories,
             labels=plot_labels,
             x_subplot_label=None,
             x_scale='Displacement [m]'
@@ -307,7 +361,7 @@ def bouc_wen(
         # plotting the displacement vs input force
         fig = hysteresis_plot(
             u_test,
-            [y_test, *y_sim_test],
+            plot_trajectories,
             labels=plot_labels
         )
 

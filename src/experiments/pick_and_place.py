@@ -11,10 +11,11 @@ from hyperopt import hp, fmin, tpe
 from matplotlib import pyplot as plt
 
 from __init__ import root_path
+from src.utils.benchmarking.pick_and_place import load_benchmarks
 from src.utils.etl import prepare_data
 from src.utils.etl.pick_and_place import load_data
 from src.utils.io.pick_and_place import prepare_simulation_data
-from src.utils.model_selection import train_validate_model
+from src.utils.model_selection import train_validate_model, score_simulation
 from src.utils.plotting import set_font
 from src.utils.plotting.trajectory_plot import trajectory_plot
 
@@ -38,6 +39,8 @@ def pick_and_place(
 
     # 01 - Loading the data
     train_data, validation_data, test_data = load_data()
+    # loading the benchmark data
+    narx_data = load_benchmarks()
 
     # 02 - Training the models
     model_names = ['SINDy', 'SINDy, Second Order']
@@ -135,6 +138,28 @@ def pick_and_place(
 
     x_test, u_test, _ = prepare_data(test_data, dt=dt)
     t_test = np.arange(len(x_test)) * dt
+
+    # adding narx
+    model_names.append('NARX')
+    narx_data = np.pad(
+        narx_data.ravel(), (x_test.shape[0] - narx_data.shape[0], 0),
+        mode='constant', constant_values=np.nan
+    ).reshape(-1, 1)
+    benchmark_scores = dict(
+        zip(
+            ['r2', 'rmse'], score_simulation(
+                x_test[~np.isnan(narx_data[:, 0]), :],
+                narx_data[~np.isnan(narx_data[:, 0]), :]
+            )
+        )
+    )
+
+    print(f' NARX '.center(120, '='))
+    print(' Scores: '.center(120, '-'))
+    print(f'-> R2: {100 * benchmark_scores["r2"]:.2f}%')
+    print(f'-> RMSE: {benchmark_scores["rmse"]:.2f}')
+    simulations.append(narx_data)
+    scores.append(benchmark_scores)
 
     # 04 - Pooling all simulation data and saving
     simulation_results, simulation_scores = prepare_simulation_data(
