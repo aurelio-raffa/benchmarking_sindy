@@ -22,6 +22,7 @@ def set_font(publish: bool = bool(os.getenv('PUBLISH'))):
         plt.rcParams["font.family"] = "serif"
         plt.rcParams["font.serif"] = ["Times New Roman"]
         plt.rcParams['font.size'] = 11
+        plt.rcParams['text.usetex'] = True
     else:
         plt.rcParams['font.family'] = 'Inter'
         plt.rcParams['font.size'] = 11
